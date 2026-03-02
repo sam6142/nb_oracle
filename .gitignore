@@ -1,0 +1,26 @@
+# Your secret keys and passwords - NEVER upload these
+.env
+
+# Virtual environment (huge folder, everyone creates their own)
+venv/
+.venv/
+
+# Data files (too large for GitHub)
+data/raw/
+data/processed/
+
+# Trained model files (large binary files)
+model/registry/*.joblib
+model/registry/*.json
+
+# Python junk files
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter notebook temp files
+.ipynb_checkpoints/
+
+# Operating system junk
+.DS_Store
+Thumbs.db
