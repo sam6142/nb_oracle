@@ -126,4 +126,37 @@ Put your architecture rules, conventions, and tech decisions in this file. Claud
 
 ---
 
+**28. XGBoost beats baseline in 88% of categories at Store 44.**
+Best: Eggs (6.0%), Dairy (6.4%), Bread/Bakery (6.5%). Worst: Magazines (20.8%), Electronics (19.0%). Categories with high zero-sale percentages (37%+) are hardest to predict.
+
+**29. Cross-store average WMAPE is 11.6% across 10 stores and 5 categories.**
+XGBoost beats baseline in 70% of store-category combos. Some stores (30, 54) are outliers — likely need location-specific features to improve.
+
+**30. Dairy is the most predictable category across all stores. Beverages is the most variable.**
+Beverages are more sensitive to external factors (weather, events, holidays), which is exactly why contextual features matter.
+
+**31. Notebooks run from the `notebooks` directory even when the file is in root.**
+Use `sys.path.insert(0, str(Path.cwd().parent))` not `sys.path.insert(0, str(Path.cwd()))` to import project modules.
+
+**32. Dashboard v2 has three pages: Store Dashboard, Multi-Store Overview, and Alert Preview.**
+The Multi-Store page trains models for all selected store-category combos and shows a color-coded heatmap, performance charts, and automated insights. The Alert Preview shows what WhatsApp messages would look like.
+
+**33. When testing the Multi-Store page, select multiple stores and categories.**
+Selecting just one store and one sparse category (like Automotive) gives misleading results. Use the core categories (Beverages, Dairy, Grocery I, Meats, Produce) across 5-10 stores for meaningful comparison.
+
+**34. SHAP explanations upgraded from fact-listing to natural storytelling.**
+Old: "Because your recent 7-day average (10,292) is above normal, it's a Sunday."
+New: "Sundays are one of your busiest days — expect higher than average traffic. Your sales have been running strong this week." The translator module lives in `explainability/translator.py` and handles day-of-week, momentum, special events, and weather narratives.
+
+**35. Confidence levels are derived from SHAP feature agreement.**
+If 80%+ of top features push the same direction = HIGH. 60-80% = MODERATE. Below 60% = LOW. This gives store owners a trust signal.
+
+**36. WhatsApp message formatter includes inventory shortfall warnings.**
+`format_whatsapp_message()` takes a prediction + current inventory and generates actionable alerts like "Consider ordering 1,414 more."
+
+**37. The full prediction-to-message pipeline works end to end.**
+Raw data → feature engineering → XGBoost prediction → SHAP values → natural language translator → WhatsApp-formatted message with inventory shortfall check. Each step is a separate module that can be tested independently.
+
+---
+
 *This file will be updated as the project continues.*
