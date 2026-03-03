@@ -1,5 +1,5 @@
 """
-The Neighborhood Oracle — Dashboard v3 (Boston + Live Weather + Events)
+The Neighborhood Oracle — Dashboard v3 (Boston + Live Weather + Events + Optuna)
 Run with: streamlit run dashboard.py
 """
 import streamlit as st
@@ -7,15 +7,45 @@ import pandas as pd
 import numpy as np
 import xgboost as xgb
 import shap
+import json
 import matplotlib.pyplot as plt
 from pathlib import Path
 from datetime import datetime, timedelta
 
 from feature_store.engineer import build_features, get_feature_columns
-from feature_store.sources.weather import fetch_weather_forecast, fetch_historical_weather
+from feature_store.sources.weather import fetch_weather_forecast
 from feature_store.sources.events import generate_boston_events, events_to_features
 from model.evaluate import compute_wmape
 from explainability.translator import get_shap_explanation, format_whatsapp_message
+
+
+# ── Load Optuna-tuned params ─────────────────────────────────────
+def load_best_params():
+    """Load Optuna-tuned params if available, otherwise use defaults."""
+    params_path = Path(r"C:\Users\syeds\OneDrive\Desktop\nboracle\nb_oracle\model\registry\optuna_best_params.json")
+    
+    if params_path.exists():
+        with open(params_path) as f:
+            params = json.load(f)
+        return params
+    
+    return {
+        "objective": "reg:tweedie",
+        "tweedie_variance_power": 1.6,
+        "n_estimators": 500,
+        "max_depth": 6,
+        "learning_rate": 0.05,
+        "subsample": 0.8,
+        "colsample_bytree": 0.7,
+        "min_child_weight": 10,
+        "reg_alpha": 0.1,
+        "reg_lambda": 1.0,
+        "random_state": 42,
+        "early_stopping_rounds": 30,
+    }
+
+BEST_PARAMS = load_best_params()
+
 
 # ── Page Config ──────────────────────────────────────────────────
 st.set_page_config(
@@ -28,6 +58,7 @@ st.set_page_config(
 BOSTON_DATA = Path(r"C:\Users\syeds\OneDrive\Desktop\nboracle\nb_oracle\data\raw\boston-bodega")
 SPLIT_DAYS_BACK = 30
 
+
 # ── Load Data ────────────────────────────────────────────────────
 @st.cache_data
 def load_boston_data():
@@ -35,12 +66,10 @@ def load_boston_data():
     holidays = pd.read_csv(BOSTON_DATA / "holidays_events.csv", parse_dates=["date"])
     weather = pd.read_csv(BOSTON_DATA / "weather_pipeline.csv", parse_dates=["date"])
     
-    # Load event features if they exist
     events_path = BOSTON_DATA / "events_features.csv"
     if events_path.exists():
         events = pd.read_csv(events_path, parse_dates=["date"])
     else:
-        # Generate them
         start = train["date"].min().strftime("%Y-%m-%d")
         end = train["date"].max().strftime("%Y-%m-%d")
         raw_events = generate_boston_events(start, end, seed=42)
@@ -49,18 +78,16 @@ def load_boston_data():
     return train, holidays, weather, events
 
 
-@st.cache_data(ttl=3600)  # Refresh every hour
+@st.cache_data(ttl=3600)
 def load_live_forecast():
-    """Fetch real 7-day weather forecast for Boston."""
     return fetch_weather_forecast()
 
 
 @st.cache_data(ttl=3600)
 def load_upcoming_events():
-    """Get upcoming Boston events for next 7 days."""
     today = datetime.now().strftime("%Y-%m-%d")
     next_week = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
-    raw = generate_boston_events(today, next_week, 
+    raw = generate_boston_events(today, next_week,
                                  seed=int(datetime.now().timestamp()) % 10000)
     dates = pd.date_range(today, next_week)
     features = events_to_features(raw, dates)
@@ -69,14 +96,13 @@ def load_upcoming_events():
 
 @st.cache_resource
 def train_model(_train, _holidays, _weather, _events, category):
-    """Train model for a specific category."""
     cat_data = (_train[_train.family == category]
                 .sort_values("date").reset_index(drop=True))
     
     if len(cat_data) < 100 or cat_data["sales"].sum() < 50:
         return None
     
-    features = build_features(cat_data, _holidays, 
+    features = build_features(cat_data, _holidays,
                                weather_df=_weather, events_df=_events).dropna()
     feat_cols = get_feature_columns(features)
     
@@ -94,13 +120,7 @@ def train_model(_train, _holidays, _weather, _events, category):
     X_test = test_df[feat_cols]
     y_test = test_df["sales"]
     
-    model = xgb.XGBRegressor(
-        objective="reg:tweedie", tweedie_variance_power=1.6,
-        n_estimators=500, max_depth=6, learning_rate=0.05,
-        subsample=0.8, colsample_bytree=0.7, min_child_weight=10,
-        reg_alpha=0.1, reg_lambda=1.0, random_state=42,
-        early_stopping_rounds=30)
-    
+    model = xgb.XGBRegressor(**BEST_PARAMS)
     model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
     
     predictions = np.maximum(model.predict(X_test), 0)
@@ -121,9 +141,8 @@ def train_model(_train, _holidays, _weather, _events, category):
     }
 
 
-def make_live_prediction(model, feat_cols, recent_sales, holidays, 
+def make_live_prediction(model, feat_cols, recent_sales, holidays,
                           weather_hist, forecast_day, event_row=None):
-    """Make a prediction for one future day using live weather."""
     forecast_date = pd.Timestamp(forecast_day["date"])
     
     future_row = pd.DataFrame({
@@ -137,7 +156,6 @@ def make_live_prediction(model, feat_cols, recent_sales, holidays,
         future_row
     ]).reset_index(drop=True)
     
-    # Filter weather to matching dates only
     combined_dates = pd.to_datetime(combined["date"])
     weather_for_combined = weather_hist[weather_hist["date"].isin(combined_dates)].copy()
     
@@ -152,7 +170,6 @@ def make_live_prediction(model, feat_cols, recent_sales, holidays,
     
     weather_for_combined = pd.concat([weather_for_combined, weather_row]).drop_duplicates(subset="date")
     
-    # Build event features if provided
     events_for_combined = None
     if event_row is not None:
         all_dates = combined_dates.tolist()
@@ -168,7 +185,7 @@ def make_live_prediction(model, feat_cols, recent_sales, holidays,
         events_for_combined = pd.concat([empty_events, forecast_event]).reset_index(drop=True)
         events_for_combined["date"] = pd.to_datetime(events_for_combined["date"])
     
-    features = build_features(combined, holidays, 
+    features = build_features(combined, holidays,
                                weather_df=weather_for_combined,
                                events_df=events_for_combined).dropna()
     
@@ -177,7 +194,6 @@ def make_live_prediction(model, feat_cols, recent_sales, holidays,
     
     last_row = features.iloc[-1]
     
-    # Make sure we have all the features the model expects
     feature_row = pd.Series(0.0, index=feat_cols)
     for col in feat_cols:
         if col in last_row.index:
@@ -190,7 +206,6 @@ def make_live_prediction(model, feat_cols, recent_sales, holidays,
 
 
 def explain_day_historical(model, features_row, feature_names, date):
-    """Generate explanation for a historical day."""
     prediction = max(model.predict(features_row.values.reshape(1, -1))[0], 0)
     result = get_shap_explanation(model, features_row, feature_names, date, prediction)
     return prediction, result["summary"], result["explanation"], result["confidence"], result["shap_series"]
@@ -200,6 +215,7 @@ def explain_day_historical(model, features_row, feature_names, date):
 train, holidays, weather, events = load_boston_data()
 live_forecast = load_live_forecast()
 raw_upcoming_events, upcoming_event_features = load_upcoming_events()
+
 
 # ── Sidebar ──────────────────────────────────────────────────────
 st.sidebar.title("🔮 The Neighborhood Oracle")
@@ -217,8 +233,15 @@ st.sidebar.markdown(
     "☀️ Weather: Open-Meteo (live)\n"
     "🎫 Events: Boston area\n"
     "📊 Sales: Mock bodega data\n"
-    "🤖 Model: XGBoost + SHAP"
+    "🤖 Model: XGBoost + Optuna + SHAP"
 )
+
+# Show if using tuned params
+params_path = Path(r"C:\Users\syeds\OneDrive\Desktop\nboracle\nb_oracle\model\registry\optuna_best_params.json")
+if params_path.exists():
+    st.sidebar.success("✅ Using Optuna-tuned params")
+else:
+    st.sidebar.warning("⚠️ Using default params")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -229,12 +252,10 @@ if page == "🔮 Live Forecast":
     st.title("🔮 Live 7-Day Forecast")
     st.markdown("Real weather + Boston events → demand predictions for the week ahead")
     
-    # Category selector
     categories = sorted(train.family.unique())
     default_cat = categories.index("BEVERAGES") if "BEVERAGES" in categories else 0
     selected_category = st.selectbox("Select Category", categories, index=default_cat)
     
-    # Train model
     with st.spinner(f"Training model for {selected_category}..."):
         result = train_model(train, holidays, weather, events, selected_category)
     
@@ -245,7 +266,6 @@ if page == "🔮 Live Forecast":
         feat_cols = result["feat_cols"]
         cat_data = result["cat_data"]
         
-        # Show current accuracy
         col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("Model Accuracy (WMAPE)", f"{result['wmape']:.1%}")
@@ -257,7 +277,6 @@ if page == "🔮 Live Forecast":
         
         st.markdown("---")
         
-        # Live weather display
         st.subheader("🌤️ This Week's Weather + Events")
         
         if live_forecast is not None:
@@ -268,7 +287,6 @@ if page == "🔮 Live Forecast":
                 dt = pd.Timestamp(fday["date"])
                 rain = "🌧️" if fday["is_precipitation"] else "☀️"
                 
-                # Check for events this day
                 day_events = raw_upcoming_events[
                     raw_upcoming_events["date"] == dt.strftime("%Y-%m-%d")
                 ] if not raw_upcoming_events.empty else pd.DataFrame()
@@ -283,7 +301,6 @@ if page == "🔮 Live Forecast":
         
         st.markdown("---")
         
-        # 7-day predictions
         st.subheader(f"📦 7-Day {selected_category} Forecast")
         
         if live_forecast is not None:
@@ -292,7 +309,6 @@ if page == "🔮 Live Forecast":
             for _, fday in live_forecast.iterrows():
                 forecast_date = pd.Timestamp(fday["date"])
                 
-                # Get event features for this day
                 event_row = None
                 if not upcoming_event_features.empty:
                     match = upcoming_event_features[
@@ -305,7 +321,6 @@ if page == "🔮 Live Forecast":
                     model, feat_cols, cat_data, holidays, weather, fday, event_row)
                 
                 if pred is not None:
-                    # Get events for display
                     day_events = raw_upcoming_events[
                         raw_upcoming_events["date"] == forecast_date.strftime("%Y-%m-%d")
                     ] if not raw_upcoming_events.empty else pd.DataFrame()
@@ -346,13 +361,10 @@ if page == "🔮 Live Forecast":
         
         st.markdown("---")
         
-        # Feature importance
         st.subheader("📊 What Drives Predictions?")
-        
         importance = pd.Series(
             model.feature_importances_, index=feat_cols
         ).sort_values(ascending=False).head(15)
-        
         st.bar_chart(importance)
 
 
@@ -479,7 +491,6 @@ elif page == "📱 Alert Preview":
             tomorrow = live_forecast.iloc[1]
             tomorrow_date = pd.Timestamp(tomorrow["date"])
             
-            # Get event row
             event_row = None
             if not upcoming_event_features.empty:
                 match = upcoming_event_features[
@@ -503,7 +514,6 @@ elif page == "📱 Alert Preview":
                     current_inventory=fake_inventory,
                 )
                 
-                # Display as phone mockup
                 st.markdown(
                     f"""
                     <div style="
@@ -526,7 +536,6 @@ elif page == "📱 Alert Preview":
                 
                 st.markdown("---")
                 
-                # Show the full week
                 st.subheader("📅 Full Week Preview")
                 
                 for _, fday in live_forecast.iterrows():
@@ -581,6 +590,6 @@ elif page == "📱 Alert Preview":
 st.markdown("---")
 st.caption(
     "🔮 The Neighborhood Oracle | Dorchester, MA | "
-    "Live weather from Open-Meteo | XGBoost + SHAP | "
+    "Live weather from Open-Meteo | XGBoost + Optuna + SHAP | "
     f"Last updated: {datetime.now().strftime('%B %d, %Y %I:%M %p')}"
 )
