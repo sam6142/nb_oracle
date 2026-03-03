@@ -179,6 +179,14 @@ Going from 20 to 35 features with ~760 rows is risky. The model has more knobs t
 **44. Feature importance proves the concept even when WMAPE doesn't improve.**
 If event features had zero importance, they'd be useless. But nearby_attendance at #2 means the model sees real signal. It just needs more data to use it reliably. This is a common pattern in ML — good features need sufficient training data to shine.
 
+**45. Optuna hyperparameter tuning improved Beverages WMAPE by 12.4% (36.7% → 32.1%).**
+100 trials, 3-5 minutes to run. Across 5 categories, average improvement was 2.8%. Three categories improved, two slightly worsened (overfitting to validation with limited data). Best params saved to model/registry/optuna_best_params.json.
+
+**46. Optuna doesn't always help every category.**
+Produce and Meats got slightly worse with tuned params. With only ~700 training days and 50 trials, Optuna can overfit to the validation window. More data and more trials would fix this. For production, tune per-category with at least 100 trials each.
+
+**47. Three-way split is important for honest evaluation.**
+Train / Validation / Test. Optuna sees validation but never test. Final numbers come from test only. If you tune on the same data you evaluate on, your numbers lie.
 ---
 
 *This file will be updated as the project continues.*
