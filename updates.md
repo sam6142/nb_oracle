@@ -157,6 +157,18 @@ If 80%+ of top features push the same direction = HIGH. 60-80% = MODERATE. Below
 **37. The full prediction-to-message pipeline works end to end.**
 Raw data → feature engineering → XGBoost prediction → SHAP values → natural language translator → WhatsApp-formatted message with inventory shortfall check. Each step is a separate module that can be tested independently.
 
+
+**38. Live weather forecasts work with Open-Meteo — no API key needed.**
+fetch_weather_forecast() pulls the real 7-day forecast for any location. fetch_historical_weather() pulls past weather back to 1940. Both free.
+
+**39. Events have three geographic tiers: nearby (< 2mi), city (2-10mi), universal.**
+Nearby events BOOST store traffic. City events may REDUCE it by drawing customers elsewhere. A Red Sox game at Fenway (3.2mi) is different from a block party down the street (0.3mi). The event_score feature captures this net effect.
+
+**40. Weather data length must match sales data length in build_features().**
+When building features for a small window (like 60 days of recent history + 1 forecast day), filter the weather to only those dates. Don't pass the entire 793-row weather history or you get a length mismatch error.
+
+**41. The full real-time pipeline works: historical data → train model → live weather + events → 7-day forecast with explanations.**
+This is the production flow. Any store's POS data + retroactive weather + upcoming events = actionable predictions.
 ---
 
 *This file will be updated as the project continues.*

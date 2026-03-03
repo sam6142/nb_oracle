@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 
 
-def build_features(df, holidays_df, weather_df=None):
+def build_features(df, holidays_df, weather_df=None, events_df=None):
     """
     Takes raw sales data and creates all the features (clues)
     that the model uses to make predictions.
@@ -16,6 +16,9 @@ def build_features(df, holidays_df, weather_df=None):
         holidays_df: DataFrame of holidays with columns 'date' and 'locale'
         weather_df: (optional) DataFrame with columns 'date', 'temp_high', etc.
                     If None, weather features are skipped.
+        events_df: (optional) DataFrame from events_to_features() with columns
+                   'date', 'nearby_events', 'city_events', 'event_score', etc.
+                   If None, event features are skipped.
     
     Returns:
         DataFrame with all features + the 'sales' target column
@@ -63,6 +66,10 @@ def build_features(df, holidays_df, weather_df=None):
     if weather_df is not None:
         data = _add_weather_features(data, weather_df)
 
+    # ── Event features (if provided) ─────────────────────────────
+    if events_df is not None:
+        data = _add_event_features(data, events_df)
+
     return data
 
 
@@ -85,16 +92,12 @@ def _add_weather_features(data, weather_df):
     data["precipitation_mm"] = weather["precipitation_mm"]
     
     # DELTA features — these are more predictive than raw values
-    # How much did temperature change vs yesterday?
     data["temp_delta_vs_yesterday"] = weather["temp_high"].diff(1)
     
-    # How much does today differ from the 7-day average?
     weekly_avg_temp = weather["temp_high"].rolling(7).mean()
     data["temp_delta_vs_weekly_avg"] = weather["temp_high"] - weekly_avg_temp
     
     # Weather severity: 0=normal, 1=notable, 2=extreme
-    # Notable = big temperature swing OR moderate rain
-    # Extreme = huge temperature swing OR heavy rain
     data["weather_severity"] = 0
     data.loc[data["temp_delta_vs_yesterday"].abs() > 5, "weather_severity"] = 1
     data.loc[
@@ -122,6 +125,37 @@ def _add_weather_features(data, weather_df):
             streak = 0
         streaks.append(streak)
     data["rain_streak_days"] = streaks
+    
+    return data
+
+
+def _add_event_features(data, events_df):
+    """
+    Adds event-based features to the dataset.
+    
+    Key insight: nearby events BOOST demand, city-level events may
+    REDUCE it by drawing customers elsewhere. The event_score captures
+    this net effect.
+    
+    nearby = within 2 miles (block parties, local festivals → more foot traffic)
+    city = 2-10 miles (Fenway, TD Garden → may pull customers away)
+    """
+    events = events_df.copy()
+    events["date"] = pd.to_datetime(events["date"])
+    events = events.set_index("date")
+    
+    event_cols = ["nearby_events", "nearby_attendance", "city_events",
+                  "city_attendance", "has_sports_nearby", "has_sports_city",
+                  "has_music", "is_marathon", "event_score"]
+    
+    for col in event_cols:
+        if col in events.columns:
+            data[col] = events[col]
+    
+    # Fill missing days with 0 (no events)
+    for col in event_cols:
+        if col in data.columns:
+            data[col] = data[col].fillna(0).astype(float)
     
     return data
 

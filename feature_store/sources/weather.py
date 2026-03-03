@@ -1,138 +1,128 @@
 """
 Weather data source.
 
-For development: generates realistic simulated weather data.
-For production: pulls from OpenWeatherMap API.
+Three modes:
+1. generate_simulated_weather() — fake data for development
+2. fetch_historical_weather() — real past weather from Open-Meteo (free)
+3. fetch_weather_forecast() — real 7-day forecast from Open-Meteo (free)
 
-WHY SIMULATE?
-Our training data is from Ecuador (2013-2017). Getting exact historical
-weather for those dates/locations for free is hard. So we simulate
-realistic weather patterns that follow seasonal cycles, then later
-swap in real API calls when we have a real store.
+No API key needed for any of these.
 """
 import numpy as np
 import pandas as pd
 import requests
-from config import OPENWEATHER_API_KEY
 
 
-def generate_simulated_weather(dates, city="Quito", seed=42):
-    """
-    Creates realistic weather data for a list of dates.
-    
-    The simulation includes:
-    - Seasonal temperature cycle (warmer in certain months)
-    - Random daily variation
-    - Precipitation that's more likely in rainy months
-    - Temperature feels-like based on humidity
-    
-    Parameters:
-        dates: list or array of dates
-        city: city name (affects base temperature)
-        seed: random seed for reproducibility
-    
-    Returns:
-        DataFrame with columns: date, temp_high, temp_feels_like,
-        precipitation_mm, is_precipitation, humidity
-    """
+# ── Boston coordinates (default) ─────────────────────────────────
+BOSTON_LAT = 42.3601
+BOSTON_LON = -71.0589
+
+
+def generate_simulated_weather(dates, seed=42):
+    """Fake weather for development. Same as before."""
     np.random.seed(seed)
     dates = pd.to_datetime(dates)
     n = len(dates)
     
-    # Quito, Ecuador sits near the equator at high altitude
-    # Temperature is fairly stable year-round (15-22°C / 59-72°F)
-    # But it has a rainy season (Oct-May) and dry season (Jun-Sep)
-    
-    # Base temperature with seasonal variation
     day_of_year = dates.dayofyear
-    # Slight seasonal cycle (warmer Feb-May, cooler Jun-Sep)
     seasonal = 2 * np.sin(2 * np.pi * (day_of_year - 60) / 365)
     
-    base_temp_c = 18  # Quito average in Celsius
-    daily_noise = np.random.normal(0, 2.5, n)  # Random daily variation
-    
+    base_temp_c = 18
+    daily_noise = np.random.normal(0, 2.5, n)
     temp_high_c = base_temp_c + seasonal + daily_noise
-    
-    # Convert to Fahrenheit (since many store owners think in F)
     temp_high_f = temp_high_c * 9/5 + 32
     
-    # Humidity (higher in rainy season)
     month = dates.month
     rainy_months = [10, 11, 12, 1, 2, 3, 4, 5]
     base_humidity = np.where(np.isin(month, rainy_months), 75, 55)
     humidity = base_humidity + np.random.normal(0, 10, n)
     humidity = np.clip(humidity, 20, 100)
     
-    # Feels-like temperature (humidity makes it feel warmer)
     feels_like_f = temp_high_f + (humidity - 50) * 0.05
     
-    # Precipitation
-    # More likely in rainy months, less in dry months
     rain_probability = np.where(np.isin(month, rainy_months), 0.55, 0.15)
     is_rain = np.random.random(n) < rain_probability
+    precip_mm = np.where(is_rain, np.random.exponential(8, n), 0)
     
-    # Amount of rain (when it rains)
-    precip_mm = np.where(
-        is_rain,
-        np.random.exponential(8, n),  # Exponential distribution for rain amounts
-        0
-    )
-    precip_mm = np.round(precip_mm, 1)
-    
-    weather_df = pd.DataFrame({
+    return pd.DataFrame({
         "date": dates,
         "temp_high": np.round(temp_high_f, 1),
         "temp_feels_like": np.round(feels_like_f, 1),
-        "precipitation_mm": precip_mm,
+        "precipitation_mm": np.round(precip_mm, 1),
         "is_precipitation": is_rain.astype(int),
         "humidity": np.round(humidity, 0),
     })
-    
-    return weather_df
 
 
-def fetch_weather_from_api(lat, lon, date):
+def fetch_historical_weather(start_date, end_date, lat=BOSTON_LAT, lon=BOSTON_LON):
     """
-    Fetch weather from OpenWeatherMap API.
-    
-    THIS IS FOR PRODUCTION USE.
-    Requires OPENWEATHER_API_KEY in .env file.
-    
-    For historical data, use the One Call API 3.0 "timemachine" endpoint.
-    For forecasts, use the standard forecast endpoint.
-    
-    Parameters:
-        lat: latitude
-        lon: longitude  
-        date: date to fetch weather for
-    
-    Returns:
-        dict with temp_high, temp_feels_like, precipitation_mm, etc.
+    Fetch REAL historical weather from Open-Meteo.
+    Free, no API key needed. Works for any date from 1940 to yesterday.
     """
-    if not OPENWEATHER_API_KEY or OPENWEATHER_API_KEY == "your_key_here":
-        raise ValueError(
-            "No OpenWeatherMap API key found. "
-            "Sign up at https://openweathermap.org/api and add your key to .env"
-        )
-    
-    # Current / forecast weather
-    url = "https://api.openweathermap.org/data/2.5/weather"
+    url = "https://archive-api.open-meteo.com/v1/archive"
     params = {
-        "lat": lat,
-        "lon": lon,
-        "appid": OPENWEATHER_API_KEY,
-        "units": "imperial"  # Fahrenheit
+        "latitude": lat,
+        "longitude": lon,
+        "start_date": start_date,
+        "end_date": end_date,
+        "daily": "temperature_2m_max,temperature_2m_min,apparent_temperature_max,precipitation_sum",
+        "temperature_unit": "fahrenheit",
+        "timezone": "America/New_York",
     }
     
     response = requests.get(url, params=params)
-    response.raise_for_status()
+    if response.status_code != 200:
+        print(f"Weather API error: {response.status_code}")
+        return None
+    
     data = response.json()
     
-    return {
-        "date": date,
-        "temp_high": data["main"]["temp_max"],
-        "temp_feels_like": data["main"]["feels_like"],
-        "precipitation_mm": data.get("rain", {}).get("1h", 0) * 1,
-        "is_precipitation": 1 if "rain" in data or "snow" in data else 0,
-        "humidity": data["main"]["humidity"],
+    df = pd.DataFrame({
+        "date": pd.to_datetime(data["daily"]["time"]),
+        "temp_high": data["daily"]["temperature_2m_max"],
+        "temp_feels_like": data["daily"]["apparent_temperature_max"],
+        "precipitation_mm": data["daily"]["precipitation_sum"],
+    }).fillna(0)
+    
+    df["is_precipitation"] = (df["precipitation_mm"] > 0.5).astype(int)
+    df["humidity"] = 65  # Open-Meteo daily doesn't include humidity
+    
+    return df
+
+
+def fetch_weather_forecast(lat=BOSTON_LAT, lon=BOSTON_LON):
+    """
+    Fetch REAL 7-day weather forecast from Open-Meteo.
+    Free, no API key needed. Returns today + next 6 days.
+    
+    This is what you'd use in production to predict tomorrow's sales.
+    """
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": "temperature_2m_max,temperature_2m_min,apparent_temperature_max,precipitation_sum,precipitation_probability_max",
+        "temperature_unit": "fahrenheit",
+        "timezone": "America/New_York",
+        "forecast_days": 7,
     }
+    
+    response = requests.get(url, params=params)
+    if response.status_code != 200:
+        print(f"Forecast API error: {response.status_code}")
+        return None
+    
+    data = response.json()
+    
+    df = pd.DataFrame({
+        "date": pd.to_datetime(data["daily"]["time"]),
+        "temp_high": data["daily"]["temperature_2m_max"],
+        "temp_feels_like": data["daily"]["apparent_temperature_max"],
+        "precipitation_mm": data["daily"]["precipitation_sum"],
+        "rain_probability": data["daily"]["precipitation_probability_max"],
+    }).fillna(0)
+    
+    df["is_precipitation"] = (df["precipitation_mm"] > 0.5).astype(int)
+    df["humidity"] = 65
+    
+    return df
