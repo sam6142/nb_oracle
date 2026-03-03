@@ -1,5 +1,5 @@
 """
-The Neighborhood Oracle — Dashboard v2
+The Neighborhood Oracle — Dashboard v3 (Boston + Live Weather + Events)
 Run with: streamlit run dashboard.py
 """
 import streamlit as st
@@ -9,9 +9,11 @@ import xgboost as xgb
 import shap
 import matplotlib.pyplot as plt
 from pathlib import Path
+from datetime import datetime, timedelta
 
 from feature_store.engineer import build_features, get_feature_columns
-from feature_store.sources.weather import generate_simulated_weather
+from feature_store.sources.weather import fetch_weather_forecast, fetch_historical_weather
+from feature_store.sources.events import generate_boston_events, events_to_features
 from model.evaluate import compute_wmape
 from explainability.translator import get_shap_explanation, format_whatsapp_message
 
@@ -22,33 +24,69 @@ st.set_page_config(
     layout="wide"
 )
 
+# ── Data Paths ───────────────────────────────────────────────────
+BOSTON_DATA = Path(r"C:\Users\syeds\OneDrive\Desktop\nboracle\nb_oracle\data\raw\boston-bodega")
+SPLIT_DAYS_BACK = 30
+
 # ── Load Data ────────────────────────────────────────────────────
 @st.cache_data
-def load_data():
-    DATA_RAW = Path(r"C:\Users\syeds\OneDrive\Desktop\nboracle\nb_oracle\data\raw\store-sales-time-series-forecasting")
-    train = pd.read_csv(DATA_RAW / "train.csv", parse_dates=["date"])
-    holidays = pd.read_csv(DATA_RAW / "holidays_events.csv", parse_dates=["date"])
-    stores = pd.read_csv(DATA_RAW / "stores.csv")
-    weather = generate_simulated_weather(train["date"].sort_values().unique())
-    return train, holidays, stores, weather
+def load_boston_data():
+    train = pd.read_csv(BOSTON_DATA / "train.csv", parse_dates=["date"])
+    holidays = pd.read_csv(BOSTON_DATA / "holidays_events.csv", parse_dates=["date"])
+    weather = pd.read_csv(BOSTON_DATA / "weather_pipeline.csv", parse_dates=["date"])
+    
+    # Load event features if they exist
+    events_path = BOSTON_DATA / "events_features.csv"
+    if events_path.exists():
+        events = pd.read_csv(events_path, parse_dates=["date"])
+    else:
+        # Generate them
+        start = train["date"].min().strftime("%Y-%m-%d")
+        end = train["date"].max().strftime("%Y-%m-%d")
+        raw_events = generate_boston_events(start, end, seed=42)
+        events = events_to_features(raw_events, pd.date_range(start, end))
+    
+    return train, holidays, weather, events
 
-SPLIT_DATE = "2017-07-15"
+
+@st.cache_data(ttl=3600)  # Refresh every hour
+def load_live_forecast():
+    """Fetch real 7-day weather forecast for Boston."""
+    return fetch_weather_forecast()
+
+
+@st.cache_data(ttl=3600)
+def load_upcoming_events():
+    """Get upcoming Boston events for next 7 days."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    next_week = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+    raw = generate_boston_events(today, next_week, 
+                                 seed=int(datetime.now().timestamp()) % 10000)
+    dates = pd.date_range(today, next_week)
+    features = events_to_features(raw, dates)
+    return raw, features
+
 
 @st.cache_resource
-def train_model(store_data, holidays, weather, category):
-    cat_data = (store_data[store_data.family == category]
+def train_model(_train, _holidays, _weather, _events, category):
+    """Train model for a specific category."""
+    cat_data = (_train[_train.family == category]
                 .sort_values("date").reset_index(drop=True))
     
     if len(cat_data) < 100 or cat_data["sales"].sum() < 50:
         return None
     
-    features = build_features(cat_data, holidays, weather_df=weather).dropna()
+    features = build_features(cat_data, _holidays, 
+                               weather_df=_weather, events_df=_events).dropna()
     feat_cols = get_feature_columns(features)
     
-    train_df = features[features.index < SPLIT_DATE]
-    test_df = features[features.index >= SPLIT_DATE]
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    split = (pd.Timestamp(yesterday) - pd.Timedelta(days=SPLIT_DAYS_BACK)).strftime("%Y-%m-%d")
     
-    if len(train_df) < 50 or len(test_df) < 5 or test_df["sales"].sum() == 0:
+    train_df = features[features.index < split]
+    test_df = features[features.index >= split]
+    
+    if len(train_df) < 50 or len(test_df) < 3:
         return None
     
     X_train = train_df[feat_cols]
@@ -79,116 +117,262 @@ def train_model(store_data, holidays, weather, category):
         "feat_cols": feat_cols,
         "wmape": wmape,
         "baseline_wmape": baseline_wmape,
+        "cat_data": cat_data,
     }
 
 
-@st.cache_data
-def run_multi_store_analysis(_train, _holidays, _weather, stores_list, categories_list):
-    results = []
-    for store_num in stores_list:
-        store_data = _train[_train.store_nbr == store_num]
-        for cat in categories_list:
-            cat_data = (store_data[store_data.family == cat]
-                        .sort_values("date").reset_index(drop=True))
-            
-            if len(cat_data) < 100 or cat_data["sales"].sum() < 50:
-                continue
-            
-            try:
-                features = build_features(cat_data, _holidays, weather_df=_weather).dropna()
-                feat_cols = get_feature_columns(features)
-                
-                train_df = features[features.index < SPLIT_DATE]
-                test_df = features[features.index >= SPLIT_DATE]
-                
-                if len(train_df) < 50 or len(test_df) < 5 or test_df["sales"].sum() == 0:
-                    continue
-                
-                X_train, y_train = train_df[feat_cols], train_df["sales"]
-                X_test, y_test = test_df[feat_cols], test_df["sales"]
-                
-                model = xgb.XGBRegressor(
-                    objective="reg:tweedie", tweedie_variance_power=1.6,
-                    n_estimators=500, max_depth=6, learning_rate=0.05,
-                    subsample=0.8, colsample_bytree=0.7, min_child_weight=10,
-                    reg_alpha=0.1, reg_lambda=1.0, random_state=42,
-                    early_stopping_rounds=30)
-                
-                model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
-                preds = np.maximum(model.predict(X_test), 0)
-                
-                baseline_pred = test_df["sales_same_dow_avg_4w"].fillna(0).values
-                
-                results.append({
-                    "store": store_num,
-                    "category": cat,
-                    "xgb_wmape": compute_wmape(y_test.values, preds),
-                    "baseline_wmape": compute_wmape(y_test.values, baseline_pred),
-                    "avg_daily_sales": y_test.mean(),
-                    "beats_baseline": compute_wmape(y_test.values, preds) < compute_wmape(y_test.values, baseline_pred),
-                })
-            except:
-                continue
+def make_live_prediction(model, feat_cols, recent_sales, holidays, 
+                          weather_hist, forecast_day, event_row=None):
+    """Make a prediction for one future day using live weather."""
+    forecast_date = pd.Timestamp(forecast_day["date"])
     
-    return pd.DataFrame(results)
+    future_row = pd.DataFrame({
+        "date": [forecast_date],
+        "sales": [0],
+        "onpromotion": [0],
+    })
+    
+    combined = pd.concat([
+        recent_sales[["date", "sales", "onpromotion"]].tail(60),
+        future_row
+    ]).reset_index(drop=True)
+    
+    # Filter weather to matching dates only
+    combined_dates = pd.to_datetime(combined["date"])
+    weather_for_combined = weather_hist[weather_hist["date"].isin(combined_dates)].copy()
+    
+    weather_row = pd.DataFrame({
+        "date": [forecast_date],
+        "temp_high": [forecast_day["temp_high"]],
+        "temp_feels_like": [forecast_day["temp_feels_like"]],
+        "precipitation_mm": [forecast_day["precipitation_mm"]],
+        "is_precipitation": [forecast_day["is_precipitation"]],
+        "humidity": [65],
+    })
+    
+    weather_for_combined = pd.concat([weather_for_combined, weather_row]).drop_duplicates(subset="date")
+    
+    # Build event features if provided
+    events_for_combined = None
+    if event_row is not None:
+        all_dates = combined_dates.tolist()
+        empty_events = pd.DataFrame({
+            "date": all_dates[:-1],
+            "nearby_events": 0, "nearby_attendance": 0,
+            "city_events": 0, "city_attendance": 0,
+            "has_sports_nearby": 0, "has_sports_city": 0,
+            "has_music": 0, "is_marathon": 0, "event_score": 0,
+        })
+        forecast_event = pd.DataFrame([event_row])
+        forecast_event["date"] = forecast_date
+        events_for_combined = pd.concat([empty_events, forecast_event]).reset_index(drop=True)
+        events_for_combined["date"] = pd.to_datetime(events_for_combined["date"])
+    
+    features = build_features(combined, holidays, 
+                               weather_df=weather_for_combined,
+                               events_df=events_for_combined).dropna()
+    
+    if len(features) == 0:
+        return None, None
+    
+    last_row = features.iloc[-1]
+    
+    # Make sure we have all the features the model expects
+    feature_row = pd.Series(0.0, index=feat_cols)
+    for col in feat_cols:
+        if col in last_row.index:
+            feature_row[col] = last_row[col]
+    
+    prediction = max(model.predict(feature_row.values.reshape(1, -1))[0], 0)
+    result = get_shap_explanation(model, feature_row, feat_cols, forecast_date, prediction)
+    
+    return prediction, result
 
 
-def explain_day(model, features_row, feature_names, date):
-    """Generate explanation using the new translator module."""
+def explain_day_historical(model, features_row, feature_names, date):
+    """Generate explanation for a historical day."""
     prediction = max(model.predict(features_row.values.reshape(1, -1))[0], 0)
     result = get_shap_explanation(model, features_row, feature_names, date, prediction)
     return prediction, result["summary"], result["explanation"], result["confidence"], result["shap_series"]
 
 
-# ── Load data ────────────────────────────────────────────────────
-train, holidays, stores_info, weather = load_data()
+# ── Load everything ──────────────────────────────────────────────
+train, holidays, weather, events = load_boston_data()
+live_forecast = load_live_forecast()
+raw_upcoming_events, upcoming_event_features = load_upcoming_events()
 
 # ── Sidebar ──────────────────────────────────────────────────────
 st.sidebar.title("🔮 The Neighborhood Oracle")
-st.sidebar.markdown("*Hyperlocal demand forecasting*")
+st.sidebar.markdown("*Dorchester Bodega — Live Demo*")
 st.sidebar.markdown("---")
 
 page = st.sidebar.radio(
     "Navigate",
-    ["📊 Store Dashboard", "🏪 Multi-Store Overview", "📱 Alert Preview"]
+    ["🔮 Live Forecast", "📊 Store Dashboard", "📱 Alert Preview"]
 )
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("**How it works:**")
+st.sidebar.markdown("**Data Sources:**")
 st.sidebar.markdown(
-    "1. Analyzes historical sales\n"
-    "2. Adds weather & calendar context\n"
-    "3. Predicts demand with XGBoost\n"
-    "4. Explains *why* using SHAP"
+    "☀️ Weather: Open-Meteo (live)\n"
+    "🎫 Events: Boston area\n"
+    "📊 Sales: Mock bodega data\n"
+    "🤖 Model: XGBoost + SHAP"
 )
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Model Stats:**")
-st.sidebar.markdown("• 88% category win rate\n• 11.6% avg WMAPE\n• 50+ store-category combos tested")
 
 
 # ═══════════════════════════════════════════════════════════════
-# PAGE 1: STORE DASHBOARD
+# PAGE 1: LIVE FORECAST
 # ═══════════════════════════════════════════════════════════════
-if page == "📊 Store Dashboard":
+if page == "🔮 Live Forecast":
     
-    st.title("🔮 Store Dashboard")
+    st.title("🔮 Live 7-Day Forecast")
+    st.markdown("Real weather + Boston events → demand predictions for the week ahead")
     
-    sel_col1, sel_col2 = st.columns(2)
-    with sel_col1:
-        store_numbers = sorted(train.store_nbr.unique())
-        selected_store = st.selectbox("Select Store", store_numbers,
-                                       index=store_numbers.index(44))
-    with sel_col2:
-        store_data = train[train.store_nbr == selected_store]
-        categories = sorted(store_data.family.unique())
-        default_cat = categories.index("BEVERAGES") if "BEVERAGES" in categories else 0
-        selected_category = st.selectbox("Select Category", categories, index=default_cat)
+    # Category selector
+    categories = sorted(train.family.unique())
+    default_cat = categories.index("BEVERAGES") if "BEVERAGES" in categories else 0
+    selected_category = st.selectbox("Select Category", categories, index=default_cat)
     
-    with st.spinner(f"Training model for Store {selected_store} — {selected_category}..."):
-        result = train_model(store_data, holidays, weather, selected_category)
+    # Train model
+    with st.spinner(f"Training model for {selected_category}..."):
+        result = train_model(train, holidays, weather, events, selected_category)
     
     if result is None:
-        st.warning(f"Not enough data for {selected_category} at Store {selected_store}.")
+        st.warning("Not enough data for this category.")
+    else:
+        model = result["model"]
+        feat_cols = result["feat_cols"]
+        cat_data = result["cat_data"]
+        
+        # Show current accuracy
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Model Accuracy (WMAPE)", f"{result['wmape']:.1%}")
+        with col2:
+            st.metric("Baseline Accuracy", f"{result['baseline_wmape']:.1%}")
+        with col3:
+            imp = (result['baseline_wmape'] - result['wmape']) / result['baseline_wmape'] * 100
+            st.metric("Improvement", f"{imp:.1f}%", delta=f"{imp:+.1f}%")
+        
+        st.markdown("---")
+        
+        # Live weather display
+        st.subheader("🌤️ This Week's Weather + Events")
+        
+        if live_forecast is not None:
+            weather_cols = st.columns(7)
+            for i, (_, fday) in enumerate(live_forecast.iterrows()):
+                if i >= 7:
+                    break
+                dt = pd.Timestamp(fday["date"])
+                rain = "🌧️" if fday["is_precipitation"] else "☀️"
+                
+                # Check for events this day
+                day_events = raw_upcoming_events[
+                    raw_upcoming_events["date"] == dt.strftime("%Y-%m-%d")
+                ] if not raw_upcoming_events.empty else pd.DataFrame()
+                
+                with weather_cols[i]:
+                    st.markdown(f"**{dt.strftime('%a')}**")
+                    st.markdown(f"## {rain}")
+                    st.markdown(f"**{fday['temp_high']:.0f}°F**")
+                    if not day_events.empty:
+                        for _, ev in day_events.head(2).iterrows():
+                            st.caption(f"🎫 {ev['name'][:20]}")
+        
+        st.markdown("---")
+        
+        # 7-day predictions
+        st.subheader(f"📦 7-Day {selected_category} Forecast")
+        
+        if live_forecast is not None:
+            forecast_data = []
+            
+            for _, fday in live_forecast.iterrows():
+                forecast_date = pd.Timestamp(fday["date"])
+                
+                # Get event features for this day
+                event_row = None
+                if not upcoming_event_features.empty:
+                    match = upcoming_event_features[
+                        pd.to_datetime(upcoming_event_features["date"]) == forecast_date
+                    ]
+                    if not match.empty:
+                        event_row = match.iloc[0].to_dict()
+                
+                pred, expl = make_live_prediction(
+                    model, feat_cols, cat_data, holidays, weather, fday, event_row)
+                
+                if pred is not None:
+                    # Get events for display
+                    day_events = raw_upcoming_events[
+                        raw_upcoming_events["date"] == forecast_date.strftime("%Y-%m-%d")
+                    ] if not raw_upcoming_events.empty else pd.DataFrame()
+                    
+                    event_names = ", ".join(day_events["name"].values[:2]) if not day_events.empty else "None"
+                    
+                    forecast_data.append({
+                        "date": forecast_date,
+                        "prediction": pred,
+                        "summary": expl["summary"],
+                        "explanation": expl["explanation"],
+                        "confidence": expl["confidence"],
+                        "temp": fday["temp_high"],
+                        "rain": fday["is_precipitation"],
+                        "events": event_names,
+                    })
+            
+            for fd in forecast_data:
+                conf_emoji = {"high": "🟢", "moderate": "🟡", "low": "🔴"}
+                rain_icon = "🌧️" if fd["rain"] else "☀️"
+                
+                with st.expander(
+                    f"{'📅'} {fd['date'].strftime('%A, %B %d')}  |  "
+                    f"**~{fd['prediction']:.0f} units**  |  "
+                    f"{rain_icon} {fd['temp']:.0f}°F  |  "
+                    f"{conf_emoji.get(fd['confidence'], '⚪')} {fd['confidence'].capitalize()}"
+                ):
+                    st.markdown(f"**{fd['summary']}**")
+                    st.info(fd["explanation"])
+                    
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        st.metric("Predicted", f"{fd['prediction']:.0f} units")
+                    with c2:
+                        st.metric("Temperature", f"{fd['temp']:.0f}°F")
+                    with c3:
+                        st.metric("Events", fd["events"][:30])
+        
+        st.markdown("---")
+        
+        # Feature importance
+        st.subheader("📊 What Drives Predictions?")
+        
+        importance = pd.Series(
+            model.feature_importances_, index=feat_cols
+        ).sort_values(ascending=False).head(15)
+        
+        st.bar_chart(importance)
+
+
+# ═══════════════════════════════════════════════════════════════
+# PAGE 2: STORE DASHBOARD (Historical)
+# ═══════════════════════════════════════════════════════════════
+elif page == "📊 Store Dashboard":
+    
+    st.title("📊 Historical Performance")
+    st.markdown("How accurate has the model been on past data?")
+    
+    categories = sorted(train.family.unique())
+    default_cat = categories.index("BEVERAGES") if "BEVERAGES" in categories else 0
+    selected_category = st.selectbox("Select Category", categories, index=default_cat)
+    
+    with st.spinner(f"Training model for {selected_category}..."):
+        result = train_model(train, holidays, weather, events, selected_category)
+    
+    if result is None:
+        st.warning("Not enough data for this category.")
     else:
         model = result["model"]
         X_test = result["X_test"]
@@ -200,23 +384,20 @@ if page == "📊 Store Dashboard":
         
         improvement = (baseline_wmape - wmape) / baseline_wmape * 100
         
-        st.markdown(f"### Store {selected_store} — {selected_category}")
-        
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("Model Error (WMAPE)", f"{wmape:.1%}")
         with col2:
             st.metric("Baseline Error", f"{baseline_wmape:.1%}")
         with col3:
-            delta_color = "normal" if improvement > 0 else "inverse"
             st.metric("Improvement", f"{improvement:.1f}%",
-                      delta=f"{improvement:+.1f}%", delta_color=delta_color)
+                      delta=f"{improvement:+.1f}%")
         with col4:
             st.metric("Avg Daily Sales", f"{y_test.mean():,.0f}")
         
         st.markdown("---")
         
-        st.subheader("📈 Predicted vs Actual Sales")
+        st.subheader("📈 Predicted vs Actual (Last 30 Days)")
         chart_data = pd.DataFrame({
             "Actual Sales": y_test.values,
             "Predicted": predictions
@@ -225,7 +406,7 @@ if page == "📊 Store Dashboard":
         
         st.markdown("---")
         
-        st.subheader("🔍 Daily Forecast Breakdown")
+        st.subheader("🔍 Daily Breakdown")
         
         available_dates = y_test.index.tolist()
         selected_date = st.select_slider(
@@ -239,20 +420,19 @@ if page == "📊 Store Dashboard":
         features_row = X_test.iloc[idx]
         actual = y_test.values[idx]
         
-        prediction, summary, explanation, confidence, shap_series = explain_day(
+        prediction, summary, explanation, confidence, shap_series = explain_day_historical(
             model, features_row, feat_cols, selected_date)
         
         fc_col, ex_col = st.columns([1, 1])
         
         with fc_col:
             st.markdown(f"#### 📅 {selected_date.strftime('%A, %B %d, %Y')}")
-            
             delta_val = prediction - actual
             delta_pct = abs(delta_val) / actual * 100 if actual > 0 else 0
             
-            st.metric("Predicted Demand", f"{prediction:,.0f} units",
+            st.metric("Predicted", f"{prediction:,.0f} units",
                       delta=f"{delta_val:+,.0f} vs actual ({delta_pct:.1f}% off)")
-            st.metric("Actual Sales", f"{actual:,.0f} units")
+            st.metric("Actual", f"{actual:,.0f} units")
             
             if delta_pct < 10:
                 st.success("✅ Excellent prediction (within 10%)")
@@ -263,182 +443,10 @@ if page == "📊 Store Dashboard":
         
         with ex_col:
             st.markdown("#### 🧠 Why This Prediction?")
-            
-            confidence_emoji = {"high": "🟢", "moderate": "🟡", "low": "🔴"}
+            conf_emoji = {"high": "🟢", "moderate": "🟡", "low": "🔴"}
             st.markdown(f"**{summary}**")
-            st.info(f"{explanation}")
-            st.markdown(f"{confidence_emoji.get(confidence, '⚪')} Confidence: **{confidence.capitalize()}**")
-            
-            st.markdown("**Top Feature Influences:**")
-            top_shap = shap_series.abs().nlargest(5)
-            for feat in top_shap.index:
-                val = features_row[feat]
-                sv = shap_series[feat]
-                icon = "🔺" if sv > 0 else "🔻"
-                st.markdown(f"{icon} **{feat.replace('_', ' ').title()}** = {val:.1f}")
-        
-        st.markdown("---")
-        
-        st.subheader("📊 What Drives Predictions?")
-        importance = pd.Series(
-            model.feature_importances_, index=feat_cols
-        ).sort_values(ascending=False).head(10)
-        st.bar_chart(importance)
-
-
-# ═══════════════════════════════════════════════════════════════
-# PAGE 2: MULTI-STORE OVERVIEW
-# ═══════════════════════════════════════════════════════════════
-elif page == "🏪 Multi-Store Overview":
-    
-    st.title("🏪 Multi-Store Performance Overview")
-    st.markdown("How well does the model perform across different stores and categories?")
-    
-    sel_col1, sel_col2 = st.columns(2)
-    with sel_col1:
-        all_stores = sorted(train.store_nbr.unique())
-        default_stores = [3, 10, 20, 30, 44, 47, 50, 52, 53, 54]
-        selected_stores = st.multiselect(
-            "Select Stores to Compare",
-            all_stores,
-            default=[s for s in default_stores if s in all_stores]
-        )
-    with sel_col2:
-        all_categories = sorted(train.family.unique())
-        default_cats = ["BEVERAGES", "GROCERY I", "PRODUCE", "DAIRY", "MEATS"]
-        selected_cats = st.multiselect(
-            "Select Categories",
-            all_categories,
-            default=[c for c in default_cats if c in all_categories]
-        )
-    
-    if not selected_stores or not selected_cats:
-        st.warning("Please select at least one store and one category.")
-    else:
-        with st.spinner(f"Training models for {len(selected_stores)} stores × {len(selected_cats)} categories..."):
-            multi_df = run_multi_store_analysis(
-                train, holidays, weather, selected_stores, selected_cats)
-        
-        if multi_df.empty:
-            st.error("No valid results. Try different stores/categories.")
-        else:
-            m1, m2, m3, m4 = st.columns(4)
-            with m1:
-                st.metric("Avg WMAPE", f"{multi_df['xgb_wmape'].mean():.1%}")
-            with m2:
-                st.metric("Models Trained", f"{len(multi_df)}")
-            with m3:
-                win_rate = multi_df["beats_baseline"].mean() * 100
-                st.metric("Beats Baseline", f"{win_rate:.0f}%")
-            with m4:
-                best = multi_df.loc[multi_df["xgb_wmape"].idxmin()]
-                st.metric("Best Combo", f"Store {int(best['store'])}, {best['category']}")
-            
-            st.markdown("---")
-            
-            st.subheader("📋 WMAPE by Store × Category")
-            st.markdown("*Lower is better. Green = good, Red = needs work.*")
-            
-            pivot = multi_df.pivot_table(
-                index="store", columns="category", values="xgb_wmape")
-            
-            def color_wmape(val):
-                if pd.isna(val):
-                    return ""
-                if val < 0.08:
-                    return "background-color: #1a5c1a; color: white"
-                elif val < 0.12:
-                    return "background-color: #2d8a2d; color: white"
-                elif val < 0.16:
-                    return "background-color: #f0ad4e; color: black"
-                else:
-                    return "background-color: #d9534f; color: white"
-            
-            st.dataframe(
-                pivot.style
-                .format("{:.1%}", na_rep="—")
-                .map(color_wmape),
-                use_container_width=True
-            )
-            
-            st.markdown("---")
-            
-            st.subheader("📈 Model Performance Across Stores")
-            
-            fig, ax = plt.subplots(figsize=(12, 5))
-            for cat in selected_cats:
-                cat_data = multi_df[multi_df["category"] == cat]
-                if not cat_data.empty:
-                    ax.plot(cat_data["store"].astype(str),
-                           cat_data["xgb_wmape"],
-                           marker="o", linewidth=2, label=cat)
-            
-            ax.set_xlabel("Store Number")
-            ax.set_ylabel("WMAPE (lower = better)")
-            ax.set_title("XGBoost Performance by Store and Category")
-            ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
-            ax.grid(True, alpha=0.3)
-            plt.tight_layout()
-            st.pyplot(fig)
-            
-            st.markdown("---")
-            
-            st.subheader("🥊 XGBoost vs Baseline — Category Averages")
-            
-            cat_avg = multi_df.groupby("category").agg({
-                "xgb_wmape": "mean",
-                "baseline_wmape": "mean",
-                "beats_baseline": "mean"
-            }).sort_values("xgb_wmape")
-            
-            fig, ax = plt.subplots(figsize=(10, 5))
-            x = range(len(cat_avg))
-            width = 0.35
-            
-            bars1 = ax.bar([i - width/2 for i in x], cat_avg["baseline_wmape"],
-                          width, label="Baseline", color="orange", alpha=0.7)
-            bars2 = ax.bar([i + width/2 for i in x], cat_avg["xgb_wmape"],
-                          width, label="XGBoost", color="steelblue", alpha=0.9)
-            
-            ax.set_ylabel("WMAPE (lower = better)")
-            ax.set_title("Average WMAPE: XGBoost vs Baseline")
-            ax.set_xticks(x)
-            ax.set_xticklabels(cat_avg.index, rotation=45, ha="right")
-            ax.legend()
-            ax.grid(True, alpha=0.3, axis="y")
-            plt.tight_layout()
-            st.pyplot(fig)
-            
-            st.markdown("---")
-            
-            st.subheader("💡 Key Insights")
-            
-            worst = multi_df.loc[multi_df["xgb_wmape"].idxmax()]
-            best = multi_df.loc[multi_df["xgb_wmape"].idxmin()]
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.success(
-                    f"**Best Performance:**\n\n"
-                    f"Store {int(best['store'])} — {best['category']}\n\n"
-                    f"WMAPE: {best['xgb_wmape']:.1%} "
-                    f"(avg {best['avg_daily_sales']:,.0f} units/day)"
-                )
-            with col2:
-                st.error(
-                    f"**Needs Improvement:**\n\n"
-                    f"Store {int(worst['store'])} — {worst['category']}\n\n"
-                    f"WMAPE: {worst['xgb_wmape']:.1%} "
-                    f"(avg {worst['avg_daily_sales']:,.0f} units/day)"
-                )
-            
-            losers = multi_df[~multi_df["beats_baseline"]]
-            if not losers.empty:
-                st.warning(
-                    f"**{len(losers)} store-category combos** where baseline beats XGBoost. "
-                    f"These may benefit from: real weather data, local event integration, "
-                    f"or store-specific feature engineering."
-                )
+            st.info(explanation)
+            st.markdown(f"{conf_emoji.get(confidence, '⚪')} Confidence: **{confidence.capitalize()}**")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -446,100 +454,133 @@ elif page == "🏪 Multi-Store Overview":
 # ═══════════════════════════════════════════════════════════════
 elif page == "📱 Alert Preview":
     
-    st.title("📱 Alert Preview")
-    st.markdown("Preview what store owners would receive via WhatsApp/SMS.")
+    st.title("📱 WhatsApp Alert Preview")
+    st.markdown("What the store owner would see on their phone tomorrow morning.")
     
-    sel_col1, sel_col2 = st.columns(2)
-    with sel_col1:
-        store_numbers = sorted(train.store_nbr.unique())
-        selected_store = st.selectbox("Store", store_numbers,
-                                       index=store_numbers.index(44), key="alert_store")
-    with sel_col2:
-        store_data = train[train.store_nbr == selected_store]
-        categories = sorted(store_data.family.unique())
-        default_cat = categories.index("BEVERAGES") if "BEVERAGES" in categories else 0
-        selected_category = st.selectbox("Category", categories,
-                                          index=default_cat, key="alert_cat")
+    categories = sorted(train.family.unique())
+    default_cat = categories.index("BEVERAGES") if "BEVERAGES" in categories else 0
+    selected_category = st.selectbox("Category", categories, index=default_cat)
     
     with st.spinner("Training model..."):
-        result = train_model(store_data, holidays, weather, selected_category)
+        result = train_model(train, holidays, weather, events, selected_category)
     
     if result is None:
-        st.warning(f"Not enough data for this combination.")
+        st.warning("Not enough data.")
     else:
         model = result["model"]
-        X_test = result["X_test"]
-        y_test = result["y_test"]
-        predictions = result["predictions"]
         feat_cols = result["feat_cols"]
+        cat_data = result["cat_data"]
         
         st.markdown("---")
         
-        st.subheader(f"📲 Last 7 Days — Store {selected_store}, {selected_category}")
-        st.markdown("*Each card below is one WhatsApp/SMS message:*")
-        
-        for i in range(-7, 0):
-            date = y_test.index[i]
-            features_row = X_test.iloc[i]
-            actual = y_test.values[i]
+        if live_forecast is not None and len(live_forecast) > 1:
+            st.subheader("📲 Tomorrow's Alert")
             
-            pred, summary, explanation, confidence, _ = explain_day(
-                model, features_row, feat_cols, date)
+            tomorrow = live_forecast.iloc[1]
+            tomorrow_date = pd.Timestamp(tomorrow["date"])
             
-            diff_pct = (pred - actual) / actual * 100 if actual > 0 else 0
+            # Get event row
+            event_row = None
+            if not upcoming_event_features.empty:
+                match = upcoming_event_features[
+                    pd.to_datetime(upcoming_event_features["date"]) == tomorrow_date
+                ]
+                if not match.empty:
+                    event_row = match.iloc[0].to_dict()
             
-            if diff_pct > 15:
-                emoji = "🟡"
-                status = "OVERSTOCKED"
-                border_color = "#f0ad4e"
-            elif diff_pct < -15:
-                emoji = "🔴"
-                status = "UNDERSTOCKED"
-                border_color = "#d9534f"
-            else:
-                emoji = "🟢"
-                status = "ON TRACK"
-                border_color = "#5cb85c"
+            pred, expl = make_live_prediction(
+                model, feat_cols, cat_data, holidays, weather, tomorrow, event_row)
             
-            confidence_emoji = {"high": "🟢", "moderate": "🟡", "low": "🔴"}
-            conf_icon = confidence_emoji.get(confidence, "⚪")
-            
-            with st.container():
+            if pred is not None:
+                fake_inventory = int(pred * np.random.uniform(0.7, 1.1))
+                
+                msg = format_whatsapp_message(
+                    store_name="Dorchester Bodega",
+                    category=selected_category,
+                    date=tomorrow_date,
+                    prediction=pred,
+                    explanation_result=expl,
+                    current_inventory=fake_inventory,
+                )
+                
+                # Display as phone mockup
                 st.markdown(
                     f"""
                     <div style="
-                        border-left: 4px solid {border_color};
-                        padding: 15px;
-                        margin: 10px 0;
-                        background-color: rgba(255,255,255,0.05);
-                        border-radius: 0 8px 8px 0;
+                        max-width: 400px;
+                        margin: 20px auto;
+                        padding: 20px;
+                        background: linear-gradient(135deg, #075e54, #128c7e);
+                        border-radius: 15px;
+                        color: white;
+                        font-family: -apple-system, sans-serif;
+                        font-size: 14px;
+                        line-height: 1.6;
+                        white-space: pre-wrap;
                     ">
-                        <strong>{emoji} {date.strftime('%A, %b %d')} — {status}</strong><br><br>
-                        <strong>{summary}</strong><br><br>
-                        {explanation}<br><br>
-                        {conf_icon} Confidence: {confidence.capitalize()}<br>
-                        📊 <strong>Actual:</strong> {actual:,.0f} units &nbsp;|&nbsp;
-                        🎯 <strong>Accuracy:</strong> {100 - abs(diff_pct):.1f}%
+{msg}
                     </div>
                     """,
                     unsafe_allow_html=True
                 )
+                
+                st.markdown("---")
+                
+                # Show the full week
+                st.subheader("📅 Full Week Preview")
+                
+                for _, fday in live_forecast.iterrows():
+                    fdate = pd.Timestamp(fday["date"])
+                    
+                    ev_row = None
+                    if not upcoming_event_features.empty:
+                        match = upcoming_event_features[
+                            pd.to_datetime(upcoming_event_features["date"]) == fdate
+                        ]
+                        if not match.empty:
+                            ev_row = match.iloc[0].to_dict()
+                    
+                    p, e = make_live_prediction(
+                        model, feat_cols, cat_data, holidays, weather, fday, ev_row)
+                    
+                    if p is not None:
+                        rain = "🌧️" if fday["is_precipitation"] else "☀️"
+                        conf_emoji = {"high": "🟢", "moderate": "🟡", "low": "🔴"}
+                        
+                        day_events = raw_upcoming_events[
+                            raw_upcoming_events["date"] == fdate.strftime("%Y-%m-%d")
+                        ] if not raw_upcoming_events.empty else pd.DataFrame()
+                        
+                        event_str = ""
+                        if not day_events.empty:
+                            event_str = f" | 🎫 {', '.join(day_events['name'].values[:2])}"
+                        
+                        with st.expander(
+                            f"{fdate.strftime('%A %b %d')} | "
+                            f"~{p:.0f} units | "
+                            f"{rain} {fday['temp_high']:.0f}°F"
+                            f"{event_str}"
+                        ):
+                            st.markdown(f"**{e['summary']}**")
+                            st.info(e["explanation"])
+                            st.markdown(f"{conf_emoji.get(e['confidence'], '⚪')} Confidence: **{e['confidence'].capitalize()}**")
         
         st.markdown("---")
         
         st.subheader("⚙️ Alert Settings")
-        st.markdown("*In production, store owners can customize these:*")
-        
         s1, s2, s3 = st.columns(3)
         with s1:
             st.slider("Max alerts per day", 1, 10, 5, key="max_alerts")
         with s2:
             st.slider("Spike threshold (%)", 10, 50, 30, key="spike_thresh")
         with s3:
-            st.selectbox("Alert channel",
-                         ["WhatsApp", "SMS", "Both"], key="channel")
+            st.selectbox("Delivery channel", ["WhatsApp", "SMS", "Both"], key="channel")
 
 
 # ── Footer ───────────────────────────────────────────────────────
 st.markdown("---")
-st.caption("Built with 🔮 The Neighborhood Oracle | XGBoost + SHAP | Powered by Streamlit")
+st.caption(
+    "🔮 The Neighborhood Oracle | Dorchester, MA | "
+    "Live weather from Open-Meteo | XGBoost + SHAP | "
+    f"Last updated: {datetime.now().strftime('%B %d, %Y %I:%M %p')}"
+)
