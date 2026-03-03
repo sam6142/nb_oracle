@@ -13,6 +13,7 @@ from pathlib import Path
 from feature_store.engineer import build_features, get_feature_columns
 from feature_store.sources.weather import generate_simulated_weather
 from model.evaluate import compute_wmape
+from explainability.translator import get_shap_explanation, format_whatsapp_message
 
 # ── Page Config ──────────────────────────────────────────────────
 st.set_page_config(
@@ -83,7 +84,6 @@ def train_model(store_data, holidays, weather, category):
 
 @st.cache_data
 def run_multi_store_analysis(_train, _holidays, _weather, stores_list, categories_list):
-    """Run model across multiple stores and categories."""
     results = []
     for store_num in stores_list:
         store_data = _train[_train.store_nbr == store_num]
@@ -134,62 +134,10 @@ def run_multi_store_analysis(_train, _holidays, _weather, stores_list, categorie
 
 
 def explain_day(model, features_row, feature_names, date):
-    explainer = shap.TreeExplainer(model)
+    """Generate explanation using the new translator module."""
     prediction = max(model.predict(features_row.values.reshape(1, -1))[0], 0)
-    sv = explainer.shap_values(features_row.values.reshape(1, -1))[0]
-    shap_series = pd.Series(sv, index=feature_names)
-    top_3 = shap_series.abs().nlargest(3).index.tolist()
-
-    reasons = []
-    for feat in top_3:
-        val = features_row[feat]
-        shap_val = shap_series[feat]
-
-        if feat == "is_weekend" and val == 1:
-            reasons.append("it's a weekend (historically your busiest days)")
-        elif feat == "is_weekend" and val == 0:
-            reasons.append("it's a weekday (typically slower)")
-        elif feat == "day_of_week":
-            day_names = ["Monday", "Tuesday", "Wednesday", "Thursday",
-                         "Friday", "Saturday", "Sunday"]
-            reasons.append(f"it's a {day_names[int(val)]}")
-        elif feat == "sales_avg_7d":
-            direction = "above" if shap_val > 0 else "below"
-            reasons.append(f"your recent 7-day average ({val:,.0f}) is {direction} normal")
-        elif feat == "sales_1w_ago":
-            reasons.append(f"same day last week you sold {val:,.0f} units")
-        elif feat == "sales_same_dow_avg_4w":
-            reasons.append(f"this weekday has been averaging {val:,.0f} units lately")
-        elif feat == "sales_trend":
-            direction = "trending up" if val > 0 else "trending down"
-            reasons.append(f"sales have been {direction} this week")
-        elif feat == "is_holiday" and val == 1:
-            reasons.append("it's a holiday")
-        elif feat == "is_payday" and val == 1:
-            reasons.append("it's around payday (people spend more)")
-        elif feat == "on_promotion" and val == 1:
-            reasons.append("this category is on promotion")
-        elif feat == "temp_delta_vs_yesterday":
-            direction = "jumping up" if val > 0 else "dropping"
-            reasons.append(f"temperature is {direction} by {abs(val):.0f}°F vs yesterday")
-        elif feat == "is_precipitation":
-            reasons.append("rain is expected — foot traffic may shift")
-        elif feat == "is_hot_day" and val == 1:
-            reasons.append("it's hotter than usual — cold items tend to spike")
-        elif feat == "is_cold_day" and val == 1:
-            reasons.append("it's cooler than usual — warm items may pick up")
-        else:
-            direction = "increasing" if shap_val > 0 else "decreasing"
-            reasons.append(f"{feat.replace('_', ' ')} is {direction} demand")
-
-    if len(reasons) >= 3:
-        reasons_text = f"{reasons[0]}, {reasons[1]}, and {reasons[2]}"
-    elif len(reasons) == 2:
-        reasons_text = f"{reasons[0]} and {reasons[1]}"
-    else:
-        reasons_text = reasons[0] if reasons else "historical patterns"
-
-    return prediction, reasons_text, shap_series
+    result = get_shap_explanation(model, features_row, feature_names, date, prediction)
+    return prediction, result["summary"], result["explanation"], result["confidence"], result["shap_series"]
 
 
 # ── Load data ────────────────────────────────────────────────────
@@ -200,7 +148,6 @@ st.sidebar.title("🔮 The Neighborhood Oracle")
 st.sidebar.markdown("*Hyperlocal demand forecasting*")
 st.sidebar.markdown("---")
 
-# Navigation
 page = st.sidebar.radio(
     "Navigate",
     ["📊 Store Dashboard", "🏪 Multi-Store Overview", "📱 Alert Preview"]
@@ -226,11 +173,10 @@ if page == "📊 Store Dashboard":
     
     st.title("🔮 Store Dashboard")
     
-    # Store and category selectors in columns
     sel_col1, sel_col2 = st.columns(2)
     with sel_col1:
         store_numbers = sorted(train.store_nbr.unique())
-        selected_store = st.selectbox("Select Store", store_numbers, 
+        selected_store = st.selectbox("Select Store", store_numbers,
                                        index=store_numbers.index(44))
     with sel_col2:
         store_data = train[train.store_nbr == selected_store]
@@ -238,7 +184,6 @@ if page == "📊 Store Dashboard":
         default_cat = categories.index("BEVERAGES") if "BEVERAGES" in categories else 0
         selected_category = st.selectbox("Select Category", categories, index=default_cat)
     
-    # Train model
     with st.spinner(f"Training model for Store {selected_store} — {selected_category}..."):
         result = train_model(store_data, holidays, weather, selected_category)
     
@@ -255,7 +200,6 @@ if page == "📊 Store Dashboard":
         
         improvement = (baseline_wmape - wmape) / baseline_wmape * 100
         
-        # ── Metrics Row ──────────────────────────────────────
         st.markdown(f"### Store {selected_store} — {selected_category}")
         
         col1, col2, col3, col4 = st.columns(4)
@@ -265,14 +209,13 @@ if page == "📊 Store Dashboard":
             st.metric("Baseline Error", f"{baseline_wmape:.1%}")
         with col3:
             delta_color = "normal" if improvement > 0 else "inverse"
-            st.metric("Improvement", f"{improvement:.1f}%", 
+            st.metric("Improvement", f"{improvement:.1f}%",
                       delta=f"{improvement:+.1f}%", delta_color=delta_color)
         with col4:
             st.metric("Avg Daily Sales", f"{y_test.mean():,.0f}")
         
         st.markdown("---")
         
-        # ── Predictions Chart ────────────────────────────────
         st.subheader("📈 Predicted vs Actual Sales")
         chart_data = pd.DataFrame({
             "Actual Sales": y_test.values,
@@ -282,7 +225,6 @@ if page == "📊 Store Dashboard":
         
         st.markdown("---")
         
-        # ── Daily Forecast Breakdown ─────────────────────────
         st.subheader("🔍 Daily Forecast Breakdown")
         
         available_dates = y_test.index.tolist()
@@ -297,7 +239,7 @@ if page == "📊 Store Dashboard":
         features_row = X_test.iloc[idx]
         actual = y_test.values[idx]
         
-        prediction, reasons_text, shap_series = explain_day(
+        prediction, summary, explanation, confidence, shap_series = explain_day(
             model, features_row, feat_cols, selected_date)
         
         fc_col, ex_col = st.columns([1, 1])
@@ -321,7 +263,11 @@ if page == "📊 Store Dashboard":
         
         with ex_col:
             st.markdown("#### 🧠 Why This Prediction?")
-            st.info(f"**Because** {reasons_text}.")
+            
+            confidence_emoji = {"high": "🟢", "moderate": "🟡", "low": "🔴"}
+            st.markdown(f"**{summary}**")
+            st.info(f"{explanation}")
+            st.markdown(f"{confidence_emoji.get(confidence, '⚪')} Confidence: **{confidence.capitalize()}**")
             
             st.markdown("**Top Feature Influences:**")
             top_shap = shap_series.abs().nlargest(5)
@@ -333,7 +279,6 @@ if page == "📊 Store Dashboard":
         
         st.markdown("---")
         
-        # ── Feature Importance ───────────────────────────────
         st.subheader("📊 What Drives Predictions?")
         importance = pd.Series(
             model.feature_importances_, index=feat_cols
@@ -349,7 +294,6 @@ elif page == "🏪 Multi-Store Overview":
     st.title("🏪 Multi-Store Performance Overview")
     st.markdown("How well does the model perform across different stores and categories?")
     
-    # Selectors
     sel_col1, sel_col2 = st.columns(2)
     with sel_col1:
         all_stores = sorted(train.store_nbr.unique())
@@ -378,7 +322,6 @@ elif page == "🏪 Multi-Store Overview":
         if multi_df.empty:
             st.error("No valid results. Try different stores/categories.")
         else:
-            # ── Summary Metrics ──────────────────────────────
             m1, m2, m3, m4 = st.columns(4)
             with m1:
                 st.metric("Avg WMAPE", f"{multi_df['xgb_wmape'].mean():.1%}")
@@ -393,17 +336,12 @@ elif page == "🏪 Multi-Store Overview":
             
             st.markdown("---")
             
-            # ── Heatmap Table ────────────────────────────────
             st.subheader("📋 WMAPE by Store × Category")
-            st.markdown("*Lower is better. Green = beats baseline.*")
+            st.markdown("*Lower is better. Green = good, Red = needs work.*")
             
             pivot = multi_df.pivot_table(
                 index="store", columns="category", values="xgb_wmape")
             
-            baseline_pivot = multi_df.pivot_table(
-                index="store", columns="category", values="baseline_wmape")
-            
-            # Style the table
             def color_wmape(val):
                 if pd.isna(val):
                     return ""
@@ -416,10 +354,6 @@ elif page == "🏪 Multi-Store Overview":
                 else:
                     return "background-color: #d9534f; color: white"
             
-            styled = (pivot
-                      .map(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
-                      .style)
-            
             st.dataframe(
                 pivot.style
                 .format("{:.1%}", na_rep="—")
@@ -429,14 +363,13 @@ elif page == "🏪 Multi-Store Overview":
             
             st.markdown("---")
             
-            # ── Performance Chart ────────────────────────────
             st.subheader("📈 Model Performance Across Stores")
             
             fig, ax = plt.subplots(figsize=(12, 5))
             for cat in selected_cats:
                 cat_data = multi_df[multi_df["category"] == cat]
                 if not cat_data.empty:
-                    ax.plot(cat_data["store"].astype(str), 
+                    ax.plot(cat_data["store"].astype(str),
                            cat_data["xgb_wmape"],
                            marker="o", linewidth=2, label=cat)
             
@@ -450,7 +383,6 @@ elif page == "🏪 Multi-Store Overview":
             
             st.markdown("---")
             
-            # ── XGBoost vs Baseline ──────────────────────────
             st.subheader("🥊 XGBoost vs Baseline — Category Averages")
             
             cat_avg = multi_df.groupby("category").agg({
@@ -463,9 +395,9 @@ elif page == "🏪 Multi-Store Overview":
             x = range(len(cat_avg))
             width = 0.35
             
-            bars1 = ax.bar([i - width/2 for i in x], cat_avg["baseline_wmape"], 
+            bars1 = ax.bar([i - width/2 for i in x], cat_avg["baseline_wmape"],
                           width, label="Baseline", color="orange", alpha=0.7)
-            bars2 = ax.bar([i + width/2 for i in x], cat_avg["xgb_wmape"], 
+            bars2 = ax.bar([i + width/2 for i in x], cat_avg["xgb_wmape"],
                           width, label="XGBoost", color="steelblue", alpha=0.9)
             
             ax.set_ylabel("WMAPE (lower = better)")
@@ -479,7 +411,6 @@ elif page == "🏪 Multi-Store Overview":
             
             st.markdown("---")
             
-            # ── Insights ─────────────────────────────────────
             st.subheader("💡 Key Insights")
             
             worst = multi_df.loc[multi_df["xgb_wmape"].idxmax()]
@@ -501,7 +432,6 @@ elif page == "🏪 Multi-Store Overview":
                     f"(avg {worst['avg_daily_sales']:,.0f} units/day)"
                 )
             
-            # Recommendations
             losers = multi_df[~multi_df["beats_baseline"]]
             if not losers.empty:
                 st.warning(
@@ -519,17 +449,16 @@ elif page == "📱 Alert Preview":
     st.title("📱 Alert Preview")
     st.markdown("Preview what store owners would receive via WhatsApp/SMS.")
     
-    # Store and category selectors
     sel_col1, sel_col2 = st.columns(2)
     with sel_col1:
         store_numbers = sorted(train.store_nbr.unique())
-        selected_store = st.selectbox("Store", store_numbers, 
+        selected_store = st.selectbox("Store", store_numbers,
                                        index=store_numbers.index(44), key="alert_store")
     with sel_col2:
         store_data = train[train.store_nbr == selected_store]
         categories = sorted(store_data.family.unique())
         default_cat = categories.index("BEVERAGES") if "BEVERAGES" in categories else 0
-        selected_category = st.selectbox("Category", categories, 
+        selected_category = st.selectbox("Category", categories,
                                           index=default_cat, key="alert_cat")
     
     with st.spinner("Training model..."):
@@ -546,7 +475,6 @@ elif page == "📱 Alert Preview":
         
         st.markdown("---")
         
-        # Show alerts for last 7 days
         st.subheader(f"📲 Last 7 Days — Store {selected_store}, {selected_category}")
         st.markdown("*Each card below is one WhatsApp/SMS message:*")
         
@@ -555,7 +483,8 @@ elif page == "📱 Alert Preview":
             features_row = X_test.iloc[i]
             actual = y_test.values[i]
             
-            pred, reasons, _ = explain_day(model, features_row, feat_cols, date)
+            pred, summary, explanation, confidence, _ = explain_day(
+                model, features_row, feat_cols, date)
             
             diff_pct = (pred - actual) / actual * 100 if actual > 0 else 0
             
@@ -572,6 +501,9 @@ elif page == "📱 Alert Preview":
                 status = "ON TRACK"
                 border_color = "#5cb85c"
             
+            confidence_emoji = {"high": "🟢", "moderate": "🟡", "low": "🔴"}
+            conf_icon = confidence_emoji.get(confidence, "⚪")
+            
             with st.container():
                 st.markdown(
                     f"""
@@ -583,10 +515,11 @@ elif page == "📱 Alert Preview":
                         border-radius: 0 8px 8px 0;
                     ">
                         <strong>{emoji} {date.strftime('%A, %b %d')} — {status}</strong><br><br>
-                        📦 <strong>Forecast:</strong> ~{pred:,.0f} units of {selected_category}<br>
-                        📊 <strong>Actual:</strong> {actual:,.0f} units<br>
-                        🎯 <strong>Accuracy:</strong> {100 - abs(diff_pct):.1f}%<br><br>
-                        💡 <strong>Why:</strong> {reasons}
+                        <strong>{summary}</strong><br><br>
+                        {explanation}<br><br>
+                        {conf_icon} Confidence: {confidence.capitalize()}<br>
+                        📊 <strong>Actual:</strong> {actual:,.0f} units &nbsp;|&nbsp;
+                        🎯 <strong>Accuracy:</strong> {100 - abs(diff_pct):.1f}%
                     </div>
                     """,
                     unsafe_allow_html=True
@@ -594,7 +527,6 @@ elif page == "📱 Alert Preview":
         
         st.markdown("---")
         
-        # Alert Settings Preview
         st.subheader("⚙️ Alert Settings")
         st.markdown("*In production, store owners can customize these:*")
         
@@ -604,7 +536,7 @@ elif page == "📱 Alert Preview":
         with s2:
             st.slider("Spike threshold (%)", 10, 50, 30, key="spike_thresh")
         with s3:
-            st.selectbox("Alert channel", 
+            st.selectbox("Alert channel",
                          ["WhatsApp", "SMS", "Both"], key="channel")
 
 
