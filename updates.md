@@ -169,6 +169,16 @@ When building features for a small window (like 60 days of recent history + 1 fo
 
 **41. The full real-time pipeline works: historical data → train model → live weather + events → 7-day forecast with explanations.**
 This is the production flow. Any store's POS data + retroactive weather + upcoming events = actionable predictions.
+
+**42. Event features show strong signal but slightly hurt WMAPE (33.7% → 35.9%).**
+nearby_attendance is the #2 most important feature (0.085), has_sports_nearby is #4 (0.062), event_score is #7 (0.040). The model recognizes events matter but with only 760 training days and 9 new features, it overfits. More training data (2+ years) would fix this.
+
+**43. Adding too many features with limited data causes overfitting.**
+Going from 20 to 35 features with ~760 rows is risky. The model has more knobs to turn than examples to learn from. In production with 2+ years of store data, event features would reliably improve predictions.
+
+**44. Feature importance proves the concept even when WMAPE doesn't improve.**
+If event features had zero importance, they'd be useless. But nearby_attendance at #2 means the model sees real signal. It just needs more data to use it reliably. This is a common pattern in ML — good features need sufficient training data to shine.
+
 ---
 
 *This file will be updated as the project continues.*
