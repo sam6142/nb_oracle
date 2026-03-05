@@ -159,6 +159,127 @@ def _add_event_features(data, events_df):
     
     return data
 
+def validate_features(df, expected_columns):
+    """
+    Check that a feature DataFrame matches what the model expects.
+    Raises an error if columns are missing or extra.
+    
+    Parameters:
+        df: DataFrame of features
+        expected_columns: list of column names the model was trained with
+    
+    Returns:
+        DataFrame with columns in the correct order
+    """
+    df_cols = set(get_feature_columns(df))
+    expected = set(expected_columns)
+    
+    missing = expected - df_cols
+    extra = df_cols - expected
+    
+    if missing:
+        raise ValueError(
+            f"Feature mismatch: model expects {len(missing)} features that are missing: "
+            f"{sorted(missing)}"
+        )
+    
+    if extra:
+        # Extra columns are okay — just ignore them with a warning
+        import logging
+        logging.getLogger(__name__).warning(
+            f"Ignoring {len(extra)} extra features not used by model: {sorted(extra)}"
+        )
+    
+    # Return columns in the exact order the model expects
+    return df[expected_columns]
+
+
+def build_prediction_features(recent_sales_df, holidays_df, weather_hist_df,
+                                forecast_weather_row, events_hist_df=None,
+                                forecast_event_row=None):
+    """
+    Build features for a single future date prediction.
+    
+    THIS IS THE ONLY WAY to build features for live predictions.
+    It uses the exact same build_features() function as training,
+    ensuring no training/serving skew.
+    
+    Parameters:
+        recent_sales_df: last 60+ days of sales (columns: date, sales, onpromotion)
+        holidays_df: holidays DataFrame
+        weather_hist_df: historical weather DataFrame
+        forecast_weather_row: dict or Series with forecast day's weather
+        events_hist_df: (optional) historical event features DataFrame
+        forecast_event_row: (optional) dict with forecast day's event features
+    
+    Returns:
+        Series of features for the forecast date (single row)
+    """
+    import pandas as pd
+    
+    forecast_date = pd.Timestamp(forecast_weather_row["date"])
+    
+    # Create the future row with unknown sales
+    future_row = pd.DataFrame({
+        "date": [forecast_date],
+        "sales": [0],
+        "onpromotion": [0],
+    })
+    
+    # Combine recent history + future date
+    combined_sales = pd.concat([
+        recent_sales_df[["date", "sales", "onpromotion"]].tail(60),
+        future_row
+    ]).reset_index(drop=True)
+    
+    # Build weather: filter history to matching dates + add forecast
+    combined_dates = pd.to_datetime(combined_sales["date"])
+    weather_filtered = weather_hist_df[
+        weather_hist_df["date"].isin(combined_dates)
+    ].copy()
+    
+    forecast_weather = pd.DataFrame([{
+        "date": forecast_date,
+        "temp_high": forecast_weather_row["temp_high"],
+        "temp_feels_like": forecast_weather_row["temp_feels_like"],
+        "precipitation_mm": forecast_weather_row["precipitation_mm"],
+        "is_precipitation": forecast_weather_row["is_precipitation"],
+        "humidity": forecast_weather_row.get("humidity", 65),
+    }])
+    
+    weather_combined = pd.concat(
+        [weather_filtered, forecast_weather]
+    ).drop_duplicates(subset="date")
+    
+    # Build events if provided
+    events_combined = None
+    if events_hist_df is not None:
+        events_filtered = events_hist_df[
+            events_hist_df["date"].isin(combined_dates)
+        ].copy()
+        
+        if forecast_event_row is not None:
+            forecast_event = pd.DataFrame([forecast_event_row])
+            forecast_event["date"] = forecast_date
+            events_combined = pd.concat(
+                [events_filtered, forecast_event]
+            ).reset_index(drop=True)
+            events_combined["date"] = pd.to_datetime(events_combined["date"])
+        else:
+            events_combined = events_filtered
+    
+    # Use the SAME build_features() as training
+    features = build_features(
+        combined_sales, holidays_df,
+        weather_df=weather_combined,
+        events_df=events_combined
+    ).dropna()
+    
+    if len(features) == 0:
+        return None
+    
+    # Return the last row (the forecast date)
+    return features.iloc[-1]
 
 def get_feature_columns(df):
     """Returns list of feature column names (everything except 'sales')."""

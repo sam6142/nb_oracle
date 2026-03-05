@@ -7,19 +7,16 @@ Three modes:
 3. fetch_weather_forecast() — real 7-day forecast from Open-Meteo (free)
 
 No API key needed for any of these.
+Coordinates come from config.py — no hardcoded values here.
 """
 import numpy as np
 import pandas as pd
 import requests
-
-
-# ── Boston coordinates (default) ─────────────────────────────────
-BOSTON_LAT = 42.3601
-BOSTON_LON = -71.0589
+from config import STORE_LAT, STORE_LON
 
 
 def generate_simulated_weather(dates, seed=42):
-    """Fake weather for development. Same as before."""
+    """Fake weather for development."""
     np.random.seed(seed)
     dates = pd.to_datetime(dates)
     n = len(dates)
@@ -54,11 +51,14 @@ def generate_simulated_weather(dates, seed=42):
     })
 
 
-def fetch_historical_weather(start_date, end_date, lat=BOSTON_LAT, lon=BOSTON_LON):
+def fetch_historical_weather(start_date, end_date, lat=None, lon=None):
     """
     Fetch REAL historical weather from Open-Meteo.
     Free, no API key needed. Works for any date from 1940 to yesterday.
     """
+    lat = lat or STORE_LAT
+    lon = lon or STORE_LON
+    
     url = "https://archive-api.open-meteo.com/v1/archive"
     params = {
         "latitude": lat,
@@ -85,18 +85,19 @@ def fetch_historical_weather(start_date, end_date, lat=BOSTON_LAT, lon=BOSTON_LO
     }).fillna(0)
     
     df["is_precipitation"] = (df["precipitation_mm"] > 0.5).astype(int)
-    df["humidity"] = 65  # Open-Meteo daily doesn't include humidity
+    df["humidity"] = 65
     
     return df
 
 
-def fetch_weather_forecast(lat=BOSTON_LAT, lon=BOSTON_LON):
+def fetch_weather_forecast(lat=None, lon=None):
     """
     Fetch REAL 7-day weather forecast from Open-Meteo.
     Free, no API key needed. Returns today + next 6 days.
-    
-    This is what you'd use in production to predict tomorrow's sales.
     """
+    lat = lat or STORE_LAT
+    lon = lon or STORE_LON
+    
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,

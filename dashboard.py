@@ -7,7 +7,6 @@ import pandas as pd
 import numpy as np
 import xgboost as xgb
 import shap
-import json
 import matplotlib.pyplot as plt
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -17,35 +16,9 @@ from feature_store.sources.weather import fetch_weather_forecast
 from feature_store.sources.events import generate_boston_events, events_to_features
 from model.evaluate import compute_wmape
 from explainability.translator import get_shap_explanation, format_whatsapp_message
-
-
-# ── Load Optuna-tuned params ─────────────────────────────────────
-def load_best_params():
-    """Load Optuna-tuned params if available, otherwise use defaults."""
-    params_path = Path(r"C:\Users\syeds\OneDrive\Desktop\nboracle\nb_oracle\model\registry\optuna_best_params.json")
-    
-    if params_path.exists():
-        with open(params_path) as f:
-            params = json.load(f)
-        return params
-    
-    return {
-        "objective": "reg:tweedie",
-        "tweedie_variance_power": 1.6,
-        "n_estimators": 500,
-        "max_depth": 6,
-        "learning_rate": 0.05,
-        "subsample": 0.8,
-        "colsample_bytree": 0.7,
-        "min_child_weight": 10,
-        "reg_alpha": 0.1,
-        "reg_lambda": 1.0,
-        "random_state": 42,
-        "early_stopping_rounds": 30,
-    }
-
-BEST_PARAMS = load_best_params()
-
+from model.train import load_model, train_and_save
+from config import get_dataset_path, get_model_params, MODEL_REGISTRY
+from model.train import load_model as load_saved_model, train_and_save
 
 # ── Page Config ──────────────────────────────────────────────────
 st.set_page_config(
@@ -54,9 +27,10 @@ st.set_page_config(
     layout="wide"
 )
 
-# ── Data Paths ───────────────────────────────────────────────────
-BOSTON_DATA = Path(r"C:\Users\syeds\OneDrive\Desktop\nboracle\nb_oracle\data\raw\boston-bodega")
+# ── Data Paths (from config.py — no hardcoded paths) ─────────────
+BOSTON_DATA = get_dataset_path()
 SPLIT_DAYS_BACK = 30
+BEST_PARAMS = get_model_params()
 
 
 # ── Load Data ────────────────────────────────────────────────────
@@ -95,48 +69,68 @@ def load_upcoming_events():
 
 
 @st.cache_resource
+@st.cache_resource
 def train_model(_train, _holidays, _weather, _events, category):
+    """Load a saved model, or train one if none exists."""
+    
+    # Try loading a saved model first
+    model, metadata = load_model(category)
+    
+    if model is not None:
+        # Rebuild test data for display purposes
+        cat_data = (_train[_train.family == category]
+                    .sort_values("date").reset_index(drop=True))
+        
+        features = build_features(cat_data, _holidays,
+                                   weather_df=_weather, events_df=_events).dropna()
+        feat_cols = metadata["feature_columns"]
+        
+        split = metadata.get("split_date", 
+                (datetime.now() - timedelta(days=SPLIT_DAYS_BACK + 1)).strftime("%Y-%m-%d"))
+        
+        test_df = features[features.index >= split]
+        
+        if len(test_df) < 1:
+            return None
+        
+        # Only use features the model knows about
+        available_cols = [c for c in feat_cols if c in test_df.columns]
+        X_test = test_df[available_cols]
+        y_test = test_df["sales"]
+        
+        predictions = np.maximum(model.predict(X_test), 0)
+        wmape = compute_wmape(y_test.values, predictions)
+        
+        baseline_pred = test_df["sales_same_dow_avg_4w"].fillna(0).values
+        baseline_wmape = compute_wmape(y_test.values, baseline_pred)
+        
+        return {
+            "model": model,
+            "X_test": X_test,
+            "y_test": y_test,
+            "predictions": predictions,
+            "feat_cols": available_cols,
+            "wmape": wmape,
+            "baseline_wmape": baseline_wmape,
+            "cat_data": cat_data,
+        }
+    
+    # No saved model — train one on the fly and save it
+    result = train_and_save(category)
+    if result is None:
+        return None
+    
     cat_data = (_train[_train.family == category]
                 .sort_values("date").reset_index(drop=True))
     
-    if len(cat_data) < 100 or cat_data["sales"].sum() < 50:
-        return None
-    
-    features = build_features(cat_data, _holidays,
-                               weather_df=_weather, events_df=_events).dropna()
-    feat_cols = get_feature_columns(features)
-    
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    split = (pd.Timestamp(yesterday) - pd.Timedelta(days=SPLIT_DAYS_BACK)).strftime("%Y-%m-%d")
-    
-    train_df = features[features.index < split]
-    test_df = features[features.index >= split]
-    
-    if len(train_df) < 50 or len(test_df) < 3:
-        return None
-    
-    X_train = train_df[feat_cols]
-    y_train = train_df["sales"]
-    X_test = test_df[feat_cols]
-    y_test = test_df["sales"]
-    
-    model = xgb.XGBRegressor(**BEST_PARAMS)
-    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
-    
-    predictions = np.maximum(model.predict(X_test), 0)
-    wmape = compute_wmape(y_test.values, predictions)
-    
-    baseline_pred = test_df["sales_same_dow_avg_4w"].fillna(0).values
-    baseline_wmape = compute_wmape(y_test.values, baseline_pred)
-    
     return {
-        "model": model,
-        "X_test": X_test,
-        "y_test": y_test,
-        "predictions": predictions,
-        "feat_cols": feat_cols,
-        "wmape": wmape,
-        "baseline_wmape": baseline_wmape,
+        "model": result["model"],
+        "X_test": result["X_test"],
+        "y_test": result["y_test"],
+        "predictions": result["predictions"],
+        "feat_cols": result["feat_cols"],
+        "wmape": result["metadata"]["wmape"],
+        "baseline_wmape": result["metadata"]["baseline_wmape"],
         "cat_data": cat_data,
     }
 
@@ -236,9 +230,8 @@ st.sidebar.markdown(
     "🤖 Model: XGBoost + Optuna + SHAP"
 )
 
-# Show if using tuned params
-params_path = Path(r"C:\Users\syeds\OneDrive\Desktop\nboracle\nb_oracle\model\registry\optuna_best_params.json")
-if params_path.exists():
+optuna_path = MODEL_REGISTRY / "optuna_best_params.json"
+if optuna_path.exists():
     st.sidebar.success("✅ Using Optuna-tuned params")
 else:
     st.sidebar.warning("⚠️ Using default params")
@@ -343,7 +336,7 @@ if page == "🔮 Live Forecast":
                 rain_icon = "🌧️" if fd["rain"] else "☀️"
                 
                 with st.expander(
-                    f"{'📅'} {fd['date'].strftime('%A, %B %d')}  |  "
+                    f"📅 {fd['date'].strftime('%A, %B %d')}  |  "
                     f"**~{fd['prediction']:.0f} units**  |  "
                     f"{rain_icon} {fd['temp']:.0f}°F  |  "
                     f"{conf_emoji.get(fd['confidence'], '⚪')} {fd['confidence'].capitalize()}"
@@ -440,7 +433,12 @@ elif page == "📊 Store Dashboard":
         with fc_col:
             st.markdown(f"#### 📅 {selected_date.strftime('%A, %B %d, %Y')}")
             delta_val = prediction - actual
-            delta_pct = abs(delta_val) / actual * 100 if actual > 0 else 0
+            if actual > 0:
+                delta_pct = abs(delta_val) / actual * 100
+            elif prediction > 0:
+                delta_pct = 100  # Predicted something but actual was 0 = bad
+            else:
+                delta_pct = 0  # Both zero = fine
             
             st.metric("Predicted", f"{prediction:,.0f} units",
                       delta=f"{delta_val:+,.0f} vs actual ({delta_pct:.1f}% off)")

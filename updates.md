@@ -187,6 +187,15 @@ Produce and Meats got slightly worse with tuned params. With only ~700 training 
 
 **47. Three-way split is important for honest evaluation.**
 Train / Validation / Test. Optuna sees validation but never test. Final numbers come from test only. If you tune on the same data you evaluate on, your numbers lie.
+
+**48. Fixed hardcoded paths — config.py now auto-detects project root.**
+All paths are relative to ROOT_DIR (where config.py lives). No more C:\Users\syeds\... anywhere. Switch datasets by changing ACTIVE_DATASET in .env. Weather and events use STORE_LAT/STORE_LON from config. get_model_params() loads Optuna params automatically with per-category support.
+
+**49. setup_path.py created for notebooks.**
+Any notebook just needs `import setup_path` to fix imports. Works whether the notebook is in root or notebooks/ folder.
+
+**50. Found bug: dashboard shows "excellent prediction" when actual is 0.**
+delta_pct defaults to 0 when actual is 0, making any prediction look perfect. Quick fix identified but deferred — will fix properly alongside confidence/prediction intervals (Issue #9).
 ---
 
 *This file will be updated as the project continues.*
