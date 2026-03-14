@@ -24,11 +24,11 @@ Ranked by priority. Fix the top ones first. Ignore the bottom ones for now.
 **Fix:** One single function should produce features for both training and inference. Add schema validation — if the feature list doesn't match exactly, raise an error.
 **Time:** 2-3 hours
 
-### 4. No data validation
-**Impact:** Bad input data (negative sales, duplicates, future dates) produces garbage predictions silently.
-**Where:** No validation anywhere in the pipeline.
-**Fix:** Add checks at data ingestion: no negative sales, no duplicate (store, category, date) combos, dates must be in the past, no gaps > 7 days without warning.
-**Time:** 1-2 hours
+### ✅ 4. No data validation — FIXED
+**Fix applied:** `data/validation.py` — 6-dimension checks (accuracy, completeness, consistency,
+timeliness, uniqueness, validity) for sales, weather, and events data.
+Integrated into `model/train.py`: errors abort training; warnings print but allow training to continue.
+Weather/events validation failures drop those features instead of aborting entirely.
 
 ---
 

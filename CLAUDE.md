@@ -98,6 +98,9 @@ feature_store/
     weather.py               → Open-Meteo API (historical + 7-day forecast, free, no key needed)
     events.py                → Boston events with 3-tier geographic impact model
 
+data/
+  validation.py              → validate_sales_data(), validate_weather_data(), validate_events_data()
+
 model/
   train.py                   → train_and_save(), load_model(), train_all_categories()
   evaluate.py                → compute_wmape()
@@ -170,12 +173,12 @@ Both datasets have identical CSV format (train.csv, stores.csv, holidays_events.
 ## Known Issues (see ISSUES.md for full prioritized list)
 
 ### 🔴 Still Open
-- #4: No data validation — must implement 6 dimensions: accuracy, completeness, consistency, timeliness, uniqueness, validity. Every data source must pass quality checks.
 
 ### ✅ Fixed
 - #1: Hardcoded paths → auto-detected in config.py
 - #2: No train/save/load → model/train.py with train_and_save() and load_model()
 - #3: Training/serving skew → build_prediction_features() uses same pipeline
+- #4: No data validation → data/validation.py with 6-dimension checks (accuracy, completeness, consistency, timeliness, uniqueness, validity); integrated into model/train.py
 
 ### Known Bugs
 - Dashboard shows "excellent prediction" when actual is 0 (delta_pct defaults to 0)

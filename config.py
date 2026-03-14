@@ -75,6 +75,18 @@ VALIDATION_WMAPE_THRESHOLD = float(
     os.getenv("MODEL_RETRAIN_WMAPE_THRESHOLD", 0.15)
 )
 
+# ── Data Validation Thresholds ───────────────────────────────────
+# Sales: above this many units/day is suspicious for a single bodega category
+VALIDATION_MAX_DAILY_SALES = int(os.getenv("VALIDATION_MAX_DAILY_SALES", 10_000))
+# Temperature bounds in Fahrenheit
+VALIDATION_MAX_TEMP_F = 150
+VALIDATION_MIN_TEMP_F = -40
+# Daily precipitation above this is extreme but physically possible
+VALIDATION_MAX_PRECIP_MM = 500
+# Warn if the most recent row in sales/weather data is older than this
+VALIDATION_STALE_SALES_DAYS = int(os.getenv("VALIDATION_STALE_SALES_DAYS", 2))
+VALIDATION_STALE_WEATHER_DAYS = int(os.getenv("VALIDATION_STALE_WEATHER_DAYS", 2))
+
 # ── Alert Settings ───────────────────────────────────────────────
 ALERT_SPIKE_FACTOR = float(os.getenv("ALERT_DEMAND_SPIKE_FACTOR", 1.3))
 ALERT_DEAD_STOCK_FACTOR = float(os.getenv("ALERT_DEAD_STOCK_FACTOR", 0.5))

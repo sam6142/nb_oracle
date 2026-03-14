@@ -30,6 +30,7 @@ from config import (
 from feature_store.engineer import build_features, get_feature_columns
 from feature_store.sources.events import generate_boston_events, events_to_features
 from model.evaluate import compute_wmape
+from data.validation import validate_sales_data, validate_weather_data, validate_events_data
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,6 +41,26 @@ MODEL_REGISTRY.mkdir(parents=True, exist_ok=True)
 # ══════════════════════════════════════════════════════════════
 # TRAINING
 # ══════════════════════════════════════════════════════════════
+
+def _log_validation_report(source_name, report):
+    """
+    Print a validation report to the logger.
+
+    Errors are logged at ERROR level (training will be stopped).
+    Warnings are logged at WARNING level (training continues with a note).
+
+    Parameters:
+        source_name: human-readable label, e.g. "Sales", "Weather"
+        report: dict returned by any validate_*_data() function
+    """
+    status = "PASSED" if report["passed"] else "FAILED"
+    logger.info(f"  [{source_name} validation] {status} — "
+                f"{len(report['errors'])} error(s), {len(report['warnings'])} warning(s)")
+    for msg in report["errors"]:
+        logger.error(f"    ✗ {msg}")
+    for msg in report["warnings"]:
+        logger.warning(f"    ⚠  {msg}")
+
 
 def train_and_save(category, test_days=30):
     """
@@ -76,7 +97,31 @@ def train_and_save(category, test_days=30):
     if len(cat_data) < 100:
         logger.warning(f"Not enough data for {category}: {len(cat_data)} rows")
         return None
-    
+
+    # ── Validate data quality ────────────────────────────────
+    # Sales: errors stop training; warnings let it continue
+    sales_report = validate_sales_data(cat_data)
+    _log_validation_report("Sales", sales_report)
+    if not sales_report["passed"]:
+        logger.error(f"Sales data failed validation for {category}. Aborting training.")
+        return None
+
+    # Weather: errors drop weather features rather than aborting entirely
+    if weather is not None:
+        weather_report = validate_weather_data(weather)
+        _log_validation_report("Weather", weather_report)
+        if not weather_report["passed"]:
+            logger.warning("Weather data failed validation — training without weather features.")
+            weather = None
+
+    # Events: same pattern — bad events data is dropped, not fatal
+    if events is not None:
+        events_report = validate_events_data(events)
+        _log_validation_report("Events", events_report)
+        if not events_report["passed"]:
+            logger.warning("Events data failed validation — training without event features.")
+            events = None
+
     # ── Build features ───────────────────────────────────────
     features = build_features(cat_data, holidays,
                                weather_df=weather, events_df=events).dropna()
@@ -272,9 +317,9 @@ if __name__ == "__main__":
     if args.category:
         result = train_and_save(args.category, test_days=args.test_days)
         if result:
-            print(f"\n✅ {args.category}: WMAPE={result['metadata']['wmape']:.1%}")
+            print(f"\nDone. {args.category}: WMAPE={result['metadata']['wmape']:.1%}")
     else:
         results = train_all_categories(test_days=args.test_days)
-        print(f"\n✅ Trained {len(results)} models")
+        print(f"\nDone. Trained {len(results)} models")
         for cat, meta in results.items():
             print(f"  {cat:<25s} WMAPE: {meta['wmape']:.1%}")

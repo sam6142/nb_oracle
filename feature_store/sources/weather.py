@@ -70,13 +70,19 @@ def fetch_historical_weather(start_date, end_date, lat=None, lon=None):
         "timezone": "America/New_York",
     }
     
-    response = requests.get(url, params=params)
+    try:
+        response = requests.get(url, params=params, timeout=10)
+    except requests.exceptions.RequestException as exc:
+        # SSL errors, connection resets, timeouts — all treated as "no data"
+        print(f"Historical weather fetch failed ({type(exc).__name__}): {exc}")
+        return None
+
     if response.status_code != 200:
         print(f"Weather API error: {response.status_code}")
         return None
-    
+
     data = response.json()
-    
+
     df = pd.DataFrame({
         "date": pd.to_datetime(data["daily"]["time"]),
         "temp_high": data["daily"]["temperature_2m_max"],
@@ -108,7 +114,13 @@ def fetch_weather_forecast(lat=None, lon=None):
         "forecast_days": 7,
     }
     
-    response = requests.get(url, params=params)
+    try:
+        response = requests.get(url, params=params, timeout=10)
+    except requests.exceptions.RequestException as exc:
+        # SSL errors, connection resets, timeouts — all treated as "no forecast"
+        print(f"Forecast weather fetch failed ({type(exc).__name__}): {exc}")
+        return None
+
     if response.status_code != 200:
         print(f"Forecast API error: {response.status_code}")
         return None

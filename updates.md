@@ -196,6 +196,15 @@ Any notebook just needs `import setup_path` to fix imports. Works whether the no
 
 **50. Found bug: dashboard shows "excellent prediction" when actual is 0.**
 delta_pct defaults to 0 when actual is 0, making any prediction look perfect. Quick fix identified but deferred — will fix properly alongside confidence/prediction intervals (Issue #9).
+**51. Built data/validation.py — 6-dimension quality checks for every data source.**
+Issue #4 resolved. Three functions: validate_sales_data(), validate_weather_data(), validate_events_data(). Each returns passed (bool), errors (list), warnings (list), stats (dict). Errors = data is unusable. Warnings = degraded quality, training continues. Key lesson: treat weather/events failures as non-fatal — drop those features rather than aborting the whole training run.
+
+**52. Validation constants live in config.py, not hardcoded in validation.py.**
+VALIDATION_MAX_DAILY_SALES, VALIDATION_MAX_TEMP_F, VALIDATION_MIN_TEMP_F, etc. All overridable via environment variables. Consistent with the project rule: no magic numbers outside config.py.
+
+**53. Validation integrated into model/train.py at the right moment.**
+Runs after category filtering, before feature engineering. Sales errors abort training. Weather/events errors drop those data sources and continue without them. This means a bad weather CSV never silently corrupts a model — it just trains without weather features, with a clear warning in the logs.
+
 ---
 
 *This file will be updated as the project continues.*

@@ -54,7 +54,12 @@ def load_boston_data():
 
 @st.cache_data(ttl=3600)
 def load_live_forecast():
-    return fetch_weather_forecast()
+    # Returns None if the Open-Meteo API is unreachable (SSL/network issue).
+    # The dashboard handles None gracefully — weather sections are skipped.
+    try:
+        return fetch_weather_forecast()
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=3600)
@@ -272,6 +277,8 @@ if page == "🔮 Live Forecast":
         
         st.subheader("🌤️ This Week's Weather + Events")
         
+        if live_forecast is None:
+            st.warning("Live weather unavailable (network/SSL error). Forecast will run without real weather data.")
         if live_forecast is not None:
             weather_cols = st.columns(7)
             for i, (_, fday) in enumerate(live_forecast.iterrows()):
