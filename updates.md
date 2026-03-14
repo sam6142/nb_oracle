@@ -196,6 +196,7 @@ Any notebook just needs `import setup_path` to fix imports. Works whether the no
 
 **50. Found bug: dashboard shows "excellent prediction" when actual is 0.**
 delta_pct defaults to 0 when actual is 0, making any prediction look perfect. Quick fix identified but deferred — will fix properly alongside confidence/prediction intervals (Issue #9).
+
 **51. Built data/validation.py — 6-dimension quality checks for every data source.**
 Issue #4 resolved. Three functions: validate_sales_data(), validate_weather_data(), validate_events_data(). Each returns passed (bool), errors (list), warnings (list), stats (dict). Errors = data is unusable. Warnings = degraded quality, training continues. Key lesson: treat weather/events failures as non-fatal — drop those features rather than aborting the whole training run.
 
